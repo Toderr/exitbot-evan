@@ -73,7 +73,7 @@ export async function renderPnlCard({ win, symbol, detail, pnlUsd, pnlSol, pnlPc
   ctx.textBaseline = "alphabetic";
   ctx.fillStyle = "#9AA0B4";
   ctx.font = `700 22px ${FONT}`;
-  ctx.fillText("EXITBOT-EVAN", px + 32, y);
+  ctx.fillText("exitbot-evan".toUpperCase(), px + 32, y);
 
   y += 52;
   ctx.fillStyle = "#FFFFFF";
