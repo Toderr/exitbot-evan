@@ -31,6 +31,7 @@ import { swapAllToSolFromKey } from "./api/jupiter.js";
 import { fetchMarketCap } from "./api/dexscreener.js";
 import { fetchOhlcv } from "./api/geckoterminal.js";
 import bot from "./telegram.js";
+import { renderPnlCard } from "./pnlCard.js";
 
 function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function fmtUsd(n) { return n == null || !Number.isFinite(n) ? "—" : `$${n.toFixed(2)}`; }
@@ -655,19 +656,28 @@ async function executeClose(entry, snap, closeReason, positions) {
   slBelowCount.delete(positionAddress);
 
   const poolLink = `https://app.meteora.ag/dlmm/${entry.poolAddress}`;
-  const closeRows = [
-    row("PnL", `<b>${fmtPct(snap.pnlPct)}</b> · ${fmtUsd(snap.pnlUsd)}`),
-    row("Fees", fmtUsd(snap.feesUsd)),
-  ];
-  if (solReceived != null) closeRows.push(row("SOL received", `<b>${solReceived.toFixed(4)} SOL</b>`));
-  await bot.sendRichHTML(
-    [
-      `${swapFailed ? "⚠️" : "✅"} <b>Closed</b>${swapFailed ? " — swap gagal" : ""}<br/>` +
-      `<b>${esc(entry.symbol)}</b> (<code>${esc(positionAddress.slice(0, 8))}…</code>) — ${esc(closeReason)}`,
-      table(closeRows),
-      `<a href="${poolLink}">Pool</a>${sigs[0] ? ` · Withdraw: <code>${sigs[0].slice(0, 20)}…</code>` : ""}`,
-    ].join("\n\n"),
-  );
+  const closeCaption =
+    `${swapFailed ? "⚠️" : "✅"} <b>Closed</b>${swapFailed ? " — swap gagal" : ""}\n` +
+    `<b>${esc(entry.symbol)}</b> (<code>${esc(positionAddress.slice(0, 8))}…</code>) — ${esc(closeReason)}\n` +
+    `<i>PnL: ${fmtPct(snap.pnlPct)} · ${fmtUsd(snap.pnlUsd)}</i>\n` +
+    `Fees: ${fmtUsd(snap.feesUsd)}\n` +
+    (solReceived != null ? `SOL received: <b>${solReceived.toFixed(4)} SOL</b>\n` : "") +
+    `<a href="${poolLink}">Pool</a>${sigs[0] ? ` · Withdraw: <code>${sigs[0].slice(0, 20)}…</code>` : ""}`;
+
+  try {
+    const png = await renderPnlCard({
+      win: (snap.pnlPct ?? 0) >= 0,
+      symbol: entry.symbol,
+      detail: closeReason,
+      pnlUsd: snap.pnlUsd,
+      pnlSol: snap.pnlSol,
+      pnlPct: snap.pnlPct,
+    });
+    await bot.sendPhoto(png, closeCaption);
+  } catch (e) {
+    log("manager_warn", `PnL card render failed: ${e.message} — falling back to text`);
+    await bot.sendHTML(closeCaption);
+  }
 
   log("manager", `Closed: ${entry.symbol} (${positionAddress.slice(0, 8)}) ${closeReason}`);
   return { closed: true };

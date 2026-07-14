@@ -88,6 +88,37 @@ export function createTelegram({ token, chatId }) {
     },
 
     /**
+     * Send a PNG image (classic sendPhoto) with an HTML caption. Caption is
+     * capped at Telegram's 1024-char photo-caption limit.
+     */
+    async sendPhoto(pngBuffer, caption = "", opts = {}) {
+      if (!base || !chatId) {
+        log("telegram_warn", "Telegram not configured — skipping send");
+        return null;
+      }
+      try {
+        const form = new FormData();
+        form.append("chat_id", String(chatId));
+        if (caption) {
+          form.append("caption", String(caption).slice(0, 1024));
+          form.append("parse_mode", "HTML");
+        }
+        if (opts.replyMarkup) form.append("reply_markup", JSON.stringify(opts.replyMarkup));
+        form.append("photo", new Blob([pngBuffer], { type: "image/png" }), "pnl-card.png");
+        const res = await fetch(`${base}/sendPhoto`, { method: "POST", body: form });
+        const json = await res.json().catch(() => null);
+        if (!res.ok || json?.ok === false) {
+          log("telegram_error", `sendPhoto ${res.status}: ${JSON.stringify(json).slice(0, 200)}`);
+          return null;
+        }
+        return json?.result?.message_id ?? null;
+      } catch (e) {
+        log("telegram_error", `sendPhoto failed: ${e.message}`);
+        return null;
+      }
+    },
+
+    /**
      * Send a RichMessage (sendRichMessage) — supports real <table> HTML,
      * unlike classic sendMessage/sendHTML. RichMessage HTML is parsed as
      * real HTML: bare "\n" is collapsed like whitespace — use <br/> for
@@ -222,6 +253,7 @@ const bot = createTelegram({
 export const isEnabled              = bot.isEnabled;
 export const sendHTML               = bot.sendHTML;
 export const sendRichHTML           = bot.sendRichHTML;
+export const sendPhoto              = bot.sendPhoto;
 export const sendMessage            = bot.sendMessage;
 export const getUpdates             = bot.getUpdates;
 export const answerCallbackQuery    = bot.answerCallbackQuery;
