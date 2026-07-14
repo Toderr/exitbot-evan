@@ -1,0 +1,6 @@
+node_modules/
+.env
+logs/
+state/*.json
+state/*.jsonl
+secrets/
