@@ -22,6 +22,14 @@ for NAME in "${SIBLINGS[@]}"; do
     continue
   fi
 
+  # Must read DST's dependencies BEFORE rsync overwrites its package.json —
+  # otherwise SRC_DEPS/DST_DEPS always match post-copy and npm install never
+  # fires, silently leaving new dependencies uninstalled on every sibling
+  # (bit us for real with @napi-rs/canvas — exitbot-papa crash-looped with
+  # ERR_MODULE_NOT_FOUND until this was caught and fixed by hand).
+  SRC_DEPS=$(node -e "console.log(JSON.stringify(require('$SRC/package.json').dependencies))")
+  DST_DEPS_BEFORE=$(node -e "console.log(JSON.stringify(require('$DST/package.json').dependencies))" 2>/dev/null || echo "")
+
   rsync -a \
     --exclude node_modules \
     --exclude .env \
@@ -38,9 +46,7 @@ for NAME in "${SIBLINGS[@]}"; do
   sed -i "s/exitbot-evan/exitbot-$NAME/g" \
     "$DST"/*.js "$DST"/api/*.js "$DST"/package.json "$DST"/CLAUDE.md 2>/dev/null || true
 
-  SRC_DEPS=$(node -e "console.log(JSON.stringify(require('$SRC/package.json').dependencies))")
-  DST_DEPS=$(node -e "console.log(JSON.stringify(require('$DST/package.json').dependencies))" 2>/dev/null || echo "")
-  if [ "$SRC_DEPS" != "$DST_DEPS" ]; then
+  if [ "$SRC_DEPS" != "$DST_DEPS_BEFORE" ]; then
     echo "Dependencies changed — running npm install in $DST"
     (cd "$DST" && npm install)
   fi
