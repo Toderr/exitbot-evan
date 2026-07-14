@@ -22,6 +22,7 @@ import {
   getAwaitingCustom,
   clearAwaitingCustom,
 } from "./manager.js";
+import { card } from "./richCard.js";
 
 const OFFSET_FILE = "./state/telegram-offset.json";
 
@@ -116,11 +117,17 @@ function fmtDeposit(c) {
 }
 
 function describeCandidate(c, index) {
-  return (
-    `${index + 1}. <b>${esc(c.symbol)}</b> — <code>${esc(c.positionAddress.slice(0, 8))}…</code>\n` +
-    `   Bins: ${c.lowerBinId}–${c.upperBinId} (${c.binCount} bins) · Shape: ${esc(c.shape)}\n` +
-    `   Deposit: ${esc(fmtDeposit(c))}`
-  );
+  return card({
+    emoji: "🔎",
+    title: `#${index + 1} Scan Candidate`,
+    subtitle: `<b>${esc(c.symbol)}</b>`,
+    rows: [
+      ["Position", `<code>${esc(c.positionAddress.slice(0, 8))}…</code>`],
+      ["Bins", `${c.lowerBinId}–${c.upperBinId} (${c.binCount} bins)`],
+      ["Shape", esc(c.shape)],
+      ["Deposit", esc(fmtDeposit(c))],
+    ],
+  });
 }
 
 async function handleScan() {
@@ -135,17 +142,21 @@ async function handleScan() {
     return;
   }
 
-  const lines = [`Found ${totalPositions} open position(s) across ${totalPools} pool(s).`];
-  if (alreadyTracked.length > 0) lines.push(`Already managed: ${alreadyTracked.length} (${alreadyTracked.map((a) => a.symbol).join(", ")})`);
+  const plainLines = [`Found ${totalPositions} open position(s) across ${totalPools} pool(s).`];
+  if (alreadyTracked.length > 0) plainLines.push(`Already managed: ${alreadyTracked.length} (${alreadyTracked.map((a) => a.symbol).join(", ")})`);
 
   if (candidates.length === 0) {
-    lines.push("No new positions to pick from — everything found is already managed.");
-    await bot.sendMessage(lines.join("\n"));
+    plainLines.push("No new positions to pick from — everything found is already managed.");
+    await bot.sendMessage(plainLines.join("\n"));
     return;
   }
 
-  lines.push("", ...candidates.map((c, i) => describeCandidate(c, i)), "", "Tap a position to choose default or custom TP/SL:");
-  await bot.sendHTML(lines.join("\n"), { replyMarkup: buildPickerKeyboard(candidates) });
+  const blocks = [
+    `<p>${plainLines.join("<br/>")}</p>`,
+    ...candidates.map((c, i) => describeCandidate(c, i)),
+    "<p>Tap a position to choose default or custom TP/SL:</p>",
+  ];
+  await bot.sendRichHTML(blocks.join("\n\n"), { replyMarkup: buildPickerKeyboard(candidates) });
 }
 
 async function handlePick(positionAddress, chatId, messageId) {

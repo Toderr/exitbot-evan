@@ -32,19 +32,14 @@ import { fetchMarketCap } from "./api/dexscreener.js";
 import { fetchOhlcv } from "./api/geckoterminal.js";
 import bot from "./telegram.js";
 import { renderPnlCard } from "./pnlCard.js";
+import { card } from "./richCard.js";
 
 function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function fmtUsd(n) { return n == null || !Number.isFinite(n) ? "—" : `$${n.toFixed(2)}`; }
 function fmtPct(n) { return n == null || !Number.isFinite(n) ? "—" : `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`; }
 
-// Status grid, sent via sendRichMessage (real <table> HTML — see
-// telegram.js sendRichHTML). This is parsed as real HTML: bare "\n"
-// elsewhere is collapsed like normal HTML whitespace — use <br/> there.
 function row(label, detail) {
-  return `<tr><td>${label}</td><td>${detail}</td></tr>`;
-}
-function table(rows) {
-  return `<table bordered>${rows.join("")}</table>`;
+  return [label, detail];
 }
 
 // ─── State ──────────────────────────────────────────────────────────────────
@@ -782,7 +777,7 @@ export async function statusText() {
   const positions = Object.values(loadPositions());
   if (positions.length === 0) return "No managed positions. Send /scan to adopt on-chain positions.";
   const wallet = process.env.WALLET_ADDRESS;
-  const blocks = [`<b>Managed positions (${positions.length})</b>`];
+  const blocks = [`<p><b>Managed positions (${positions.length})</b></p>`];
   for (const entry of positions) {
     const deposit = entry.depositSol != null
       ? `${entry.depositSol.toFixed(4)} SOL${entry.depositUsd != null ? ` ($${entry.depositUsd.toFixed(2)})` : ""}`
@@ -805,6 +800,7 @@ export async function statusText() {
       `${entry.runnerMode ? " (🏃 runner)" : ""}`;
 
     const rows = [
+      row("Position", `<code>${esc(entry.positionAddress.slice(0, 8))}…</code>`),
       row("Bins", `${entry.lowerBinId}–${entry.upperBinId} (${entry.binCount})`),
       row("Shape", esc(entry.shape ?? "—")),
       row("Deposit", esc(deposit)),
@@ -812,13 +808,13 @@ export async function statusText() {
       row("TP / SL", tpSlDetail),
     ];
 
-    blocks.push(
-      [
-        `<b>${esc(entry.symbol)}</b> — <code>${esc(entry.positionAddress.slice(0, 8))}…</code> (pool <code>${esc(entry.poolAddress.slice(0, 8))}…</code>)`,
-        table(rows),
-        `<a href="https://app.meteora.ag/dlmm/${entry.poolAddress}">Pool</a>`,
-      ].join("\n\n"),
-    );
+    blocks.push(card({
+      emoji: "📟",
+      title: "Managed Position",
+      subtitle: `<b>${esc(entry.symbol)}</b> · pool <code>${esc(entry.poolAddress.slice(0, 8))}…</code>`,
+      rows,
+      links: [`<a href="https://app.meteora.ag/dlmm/${entry.poolAddress}">Pool</a>`],
+    }));
   }
   return blocks.join("\n\n");
 }
