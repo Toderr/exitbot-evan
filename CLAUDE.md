@@ -49,7 +49,12 @@ reuse evilpanda-screener's tokens, so alerts/commands stay separated.
    fetch PnL/range from the Meteora datapi (`fetchDlmmPnl`), apply the
    high-TVL guard, and check SL/TP/OOR. On trigger: withdraw the position,
    swap the token side to SOL (Jupiter, Meteora fallback), log to
-   `state/journal.jsonl`, remove from state, and notify Telegram.
+   `state/journal.jsonl`, remove from state, and notify Telegram. If the
+   datapi stops reporting a managed position as open for 2 consecutive
+   ticks, the bot double-checks the position account on-chain
+   (`positionAccountExists`) — if it's genuinely gone (e.g. closed manually
+   outside the bot), it's auto-forgotten with a Telegram notification
+   instead of being silently checked forever.
 4. `/scan` again any time you open a new position manually — it'll show up
    as a new button (already-managed ones won't re-appear).
 
@@ -95,8 +100,7 @@ want them to stay in sync.
 |---|---|
 | `/scan` | Enumerate wallet on-chain, show a button per new SOL-quoted position (one per position, not per pool) to pick which to manage |
 | `/status` | List currently managed positions + their TP/SL |
-| `/stop` | Show a picker: stop managing one specific position, or "Stop ALL" to pause auto-close globally (positions stay tracked, no closes fire) |
-| `/start` | Resume auto-close (after a "Stop ALL") |
+| `/stop` | Show a picker: stop managing one specific position, or "Stop ALL" to stop managing every currently managed position (each left untouched on-chain) — the bot itself and its 15s cron keep running |
 | `/forget <positionAddress>` | Stop managing a position directly by address (does not close it on-chain) |
 | `/help` | Show command list |
 
@@ -109,7 +113,7 @@ transactions).
 index.js              — entry point (listener + 15s cron)
 config.js              — thresholds
 manager.js              — /scan candidate discovery, adoption, snapshot, high-TVL guard, SL/TP/OOR close
-telegramListener.js     — command + inline-keyboard long-poll (/scan picker, /status /start /stop /forget /help)
+telegramListener.js     — command + inline-keyboard long-poll (/scan picker, /status /stop /forget /help)
 telegram.js             — HTML sender + getUpdates
 logger.js               — file + console logger (logs/exitbot-YYYY-MM-DD.log)
 api/
@@ -120,7 +124,6 @@ api/
 state/
   positions.json          — managed positions (gitignored)
   pending-scan.json        — /scan candidates awaiting a button tap (gitignored)
-  control.json             — auto-close enabled/disabled flag (gitignored)
   journal.jsonl             — append-only close log (gitignored)
   telegram-offset.json       — getUpdates offset (gitignored)
 ```

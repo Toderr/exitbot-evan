@@ -9,7 +9,7 @@ import "dotenv/config";
 import cron from "node-cron";
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { runExitCheck, isEnabled } from "./manager.js";
+import { runExitCheck } from "./manager.js";
 import { startListener } from "./telegramListener.js";
 import bot from "./telegram.js";
 
@@ -21,7 +21,6 @@ async function tick() {
     log("main", "Exit-check tick still running — skipping overlapping tick");
     return;
   }
-  if (!isEnabled()) return;
   tickRunning = true;
   try {
     const result = await runExitCheck();

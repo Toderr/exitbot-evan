@@ -83,6 +83,24 @@ export async function fetchPoolsForToken(mint) {
 }
 
 /**
+ * Check whether a DLMM position account still exists on-chain. A position
+ * account is closed (rent reclaimed) once its liquidity is fully withdrawn —
+ * whether that withdrawal was done by this bot or manually — so a null
+ * result here means the position is gone for good, not just temporarily
+ * out of range.
+ *
+ * @param {string} rpcUrl
+ * @param {string} positionAddress
+ * @returns {Promise<boolean>}
+ */
+export async function positionAccountExists(rpcUrl, positionAddress) {
+  const { Connection, PublicKey } = require("@solana/web3.js");
+  const conn = new Connection(rpcUrl, "confirmed");
+  const info = await conn.getAccountInfo(new PublicKey(positionAddress));
+  return info !== null;
+}
+
+/**
  * Enumerate all open DLMM LP positions for a wallet via Solana RPC.
  *
  * Uses the Meteora SDK's `DLMM.getAllLbPairPositionsByUser`, which does a single

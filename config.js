@@ -49,7 +49,6 @@ export const config = {
   maxCloseFailures: 4,
 
   stateFile: "./state/positions.json",
-  controlFile: "./state/control.json",
   journalFile: "./state/journal.jsonl",
   pendingScanFile: "./state/pending-scan.json",
   awaitingCustomFile: "./state/awaiting-custom.json",

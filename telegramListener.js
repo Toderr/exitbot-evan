@@ -16,7 +16,6 @@ import {
   listPending,
   listManaged,
   statusText,
-  setEnabled,
   forget,
   setAwaitingCustom,
   getAwaitingCustom,
@@ -41,29 +40,29 @@ const HELP_TEXT =
   "<b>exitbot-evan</b>\n" +
   "/scan — scan wallet on-chain for DLMM positions; pick which ones to manage from the button list\n" +
   "/status — list currently managed positions\n" +
-  "/stop — pick a managed position to stop managing (or stop ALL / pause auto-close)\n" +
-  "/start — resume auto-close (after \"Stop ALL\")\n" +
+  "/stop — pick a managed position to stop managing (or stop ALL managed positions)\n" +
   "/forget &lt;positionAddress&gt; — stop managing a position without closing it\n" +
   "/cancel — cancel a pending custom TP/SL prompt\n" +
   "/help — this message";
 
 // /stop picker: one "stop managing this" button per currently managed
-// position, plus a "Stop ALL" button that pauses auto-close globally
-// (positions stay tracked, resume with /start) rather than forgetting them.
+// position, plus a "Stop ALL" button that forgets every currently managed
+// position (each left untouched on-chain) — the bot itself keeps running
+// and will pick up new positions again via /scan.
 function buildStopKeyboard(managed) {
   const rows = managed.map((p) => ([
     { text: `⛔ ${p.symbol} (${p.positionAddress.slice(0, 6)}…)`, callback_data: `stopone:${p.positionAddress}` },
   ]));
-  rows.push([{ text: "🛑 Stop ALL (pause auto-close)", callback_data: "stopall" }]);
+  if (managed.length > 1) {
+    rows.push([{ text: "🛑 Stop ALL (forget all managed positions)", callback_data: "stopall" }]);
+  }
   return { inline_keyboard: rows };
 }
 
 async function handleStop() {
   const managed = listManaged();
   if (managed.length === 0) {
-    await bot.sendHTML("Nothing is currently managed. (Auto-close pause is still available: tap below.)", {
-      replyMarkup: { inline_keyboard: [[{ text: "🛑 Stop ALL (pause auto-close)", callback_data: "stopall" }]] },
-    });
+    await bot.sendMessage("Nothing is currently managed.");
     return;
   }
   const lines = [
@@ -80,9 +79,10 @@ function handleStopOne(positionAddress) {
 }
 
 function handleStopAll() {
-  setEnabled(false);
-  log("listener", "auto-close disabled via /stop → Stop ALL");
-  return { ok: true, text: "🛑 Auto-close PAUSED for all positions. Positions remain tracked; send /start to resume." };
+  const managed = listManaged();
+  for (const p of managed) forget(p.positionAddress);
+  log("listener", `stopped managing all ${managed.length} position(s) via /stop → Stop ALL`);
+  return { ok: true, text: `⛔ Stopped managing all ${managed.length} position(s) (left untouched on-chain).` };
 }
 
 // Step 1 of adoption: one "pick" button per candidate (numbered to match the
@@ -329,10 +329,6 @@ export function startListener() {
               log("listener_error", `/stop failed: ${e.message}`);
               await bot.sendMessage(`❌ Error: ${e.message}`);
             }
-          } else if (cmd === "/start") {
-            setEnabled(true);
-            await bot.sendMessage("✅ Auto-close RESUMED.");
-            log("listener", "auto-close enabled via /start");
           } else if (cmd === "/forget") {
             const positionAddress = rest[0];
             if (!positionAddress) {

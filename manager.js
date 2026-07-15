@@ -25,6 +25,7 @@ import {
   fetchPoolInfo,
   withdrawPosition,
   swapTokenToSolViaMeteora,
+  positionAccountExists,
   QUOTE_MINTS,
 } from "./api/meteora.js";
 import { swapAllToSolFromKey } from "./api/jupiter.js";
@@ -55,21 +56,6 @@ function savePositions(positions) {
   fs.writeFileSync(config.stateFile, JSON.stringify(positions, null, 2));
 }
 
-export function loadControl() {
-  if (!fs.existsSync(config.controlFile)) return { enabled: true };
-  try { return JSON.parse(fs.readFileSync(config.controlFile, "utf8")); }
-  catch { return { enabled: true }; }
-}
-
-export function setEnabled(enabled) {
-  fs.mkdirSync(path.dirname(config.controlFile), { recursive: true });
-  fs.writeFileSync(config.controlFile, JSON.stringify({ enabled: !!enabled, updatedAt: new Date().toISOString() }, null, 2));
-}
-
-export function isEnabled() {
-  return loadControl().enabled !== false;
-}
-
 function appendJournal(entry) {
   try {
     fs.mkdirSync(path.dirname(config.journalFile), { recursive: true });
@@ -83,6 +69,14 @@ function appendJournal(entry) {
 // single anomalous datapi glitch (in-memory only; resets on restart, matching
 // evilpanda-screener's manager.js behavior).
 const slBelowCount = new Map(); // positionAddress → count
+
+// A position missing from the datapi's open-positions response for N
+// consecutive ticks (filters a single stale-datapi blip) triggers an
+// on-chain existence check — if the account is truly gone (closed manually
+// or otherwise, outside this bot), it's auto-forgotten with a notification
+// instead of being checked for SL/TP forever.
+const missingCount = new Map(); // positionAddress → count
+const MISSING_CONSECUTIVE_TICKS = 2;
 
 // ─── /scan — enumerate on-chain positions, let the user pick which to manage ─
 // Two-step flow: /scan finds candidates and stores them in
@@ -354,7 +348,7 @@ async function buildSnapshot(entry, walletAddress) {
     oorAbove = oor && positions.every((p) => Number(p.poolActiveBinId) > Number(p.upperBinId));
   }
 
-  return { oor, oorBelow, oorAbove, pnlUsd, pnlSol, pnlPct, feesUsd, unclaimedFeesUsd, claimedFeesUsd, _positions };
+  return { oor, oorBelow, oorAbove, pnlUsd, pnlSol, pnlPct, feesUsd, unclaimedFeesUsd, claimedFeesUsd, _positions, matched: positions.length > 0 };
 }
 
 // ─── High-TVL guard ──────────────────────────────────────────────────────────
@@ -704,6 +698,43 @@ export async function runExitCheck() {
       log("manager_warn", `snapshot failed for ${entry.positionAddress.slice(0, 8)}: ${e.message}`);
       continue;
     }
+
+    if (!snap.matched) {
+      const n = (missingCount.get(entry.positionAddress) ?? 0) + 1;
+      missingCount.set(entry.positionAddress, n);
+      log("manager_warn", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}): not in datapi's open positions (${n}/${MISSING_CONSECUTIVE_TICKS})`);
+
+      if (n >= MISSING_CONSECUTIVE_TICKS) {
+        let stillExists = true;
+        try {
+          stillExists = await positionAccountExists(process.env.HELIUS_RPC_URL, entry.positionAddress);
+        } catch (e) {
+          log("manager_warn", `on-chain existence check failed for ${entry.positionAddress.slice(0, 8)}: ${e.message}`);
+        }
+
+        if (!stillExists) {
+          delete positions[entry.positionAddress];
+          savePositions(positions);
+          slBelowCount.delete(entry.positionAddress);
+          missingCount.delete(entry.positionAddress);
+          log("manager", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}) — position no longer exists on-chain, auto-forgot`);
+          await bot.sendHTML(
+            card({
+              emoji: "🗑️",
+              title: "Position Gone",
+              subtitle: `<b>${esc(entry.symbol)}</b>`,
+              rows: [
+                ["Position", `<code>${esc(entry.positionAddress.slice(0, 8))}…</code>`],
+                ["Note", "Closed outside the bot (manual close?) — stopped managing it."],
+              ],
+            }),
+          );
+          continue;
+        }
+      }
+      continue; // no PnL data this tick — skip SL/TP/OOR evaluation
+    }
+    missingCount.delete(entry.positionAddress);
 
     let poolData = null;
     try {
