@@ -718,7 +718,7 @@ export async function runExitCheck() {
           slBelowCount.delete(entry.positionAddress);
           missingCount.delete(entry.positionAddress);
           log("manager", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}) — position no longer exists on-chain, auto-forgot`);
-          await bot.sendHTML(
+          await bot.sendRichHTML(
             card({
               emoji: "🗑️",
               title: "Position Gone",
