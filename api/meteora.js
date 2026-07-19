@@ -12,6 +12,7 @@
  */
 
 import { createRequire } from "module";
+import { config } from "../config.js";
 
 const HOST = process.env.METEORA_DLMM_HOST ?? "https://dlmm.datapi.meteora.ag";
 
@@ -25,6 +26,50 @@ export const QUOTE_MINTS = {
 };
 
 const GECKO_HOST = "https://api.geckoterminal.com/api/v2";
+
+// Solana RPC calls (getAccountInfo, sendAndConfirmTransaction, etc.) have no
+// built-in timeout — if the RPC node stops responding mid-request, the promise
+// just hangs forever instead of rejecting. That once froze the whole bot: a
+// hung withdraw call kept index.js's tickRunning flag stuck `true` and every
+// cron tick after it was skipped indefinitely. Wrap RPC-bound calls with this
+// so they reject on a stall instead of hanging.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Helius's getPriorityFeeEstimate (same RPC endpoint, custom method) — returns
+// microLamports/CU. Falls back to `floor` if the RPC doesn't support the
+// method (non-Helius endpoint) or the call fails/times out, so this never
+// blocks a withdraw on the fee lookup itself.
+async function getPriorityFeeMicroLamports(rpcUrl, accountKeys, { floorMicroLamports, capMicroLamports }) {
+  try {
+    const res = await withTimeout(
+      fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "withdraw-priority-fee",
+          method: "getPriorityFeeEstimate",
+          params: [{ accountKeys, options: { recommended: true } }],
+        }),
+      }).then((r) => r.json()),
+      5_000,
+      "getPriorityFeeEstimate",
+    );
+    const estimate = res?.result?.priorityFeeEstimate;
+    if (typeof estimate === "number" && estimate > 0) {
+      return Math.min(capMicroLamports, Math.max(floorMicroLamports, Math.round(estimate)));
+    }
+  } catch {
+    // Non-Helius RPC or a transient failure — fall back to the floor below.
+  }
+  return floorMicroLamports;
+}
 
 // Find Meteora DLMM pool addresses for a token via GeckoTerminal, then hydrate
 // each address with full metadata from the Meteora datapi.
@@ -181,7 +226,7 @@ export async function fetchUserPositions(rpcUrl, walletAddress) {
  */
 export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, position) {
   const DLMM = require("@meteora-ag/dlmm");
-  const { Connection, PublicKey, Keypair, sendAndConfirmTransaction } = require("@solana/web3.js");
+  const { Connection, PublicKey, Keypair, ComputeBudgetProgram, sendAndConfirmTransaction } = require("@solana/web3.js");
 
   const secretKey = bs58.default?.decode
     ? bs58.default.decode(privateKeyBase58)
@@ -190,18 +235,23 @@ export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, po
   const conn    = new Connection(rpcUrl, "confirmed");
 
   const positionPubkey = new PublicKey(position.publicKey);
+  const poolPubkey     = new PublicKey(poolAddress);
 
   // Guard: if the position account is gone (already closed or stale datapi),
   // fail fast with a clear message instead of paying for DLMM.create()'s
   // multi-round-trip pool/bin-array fetch only to null-deref inside the SDK.
   // A single getAccountInfo call here is far cheaper than DLMM.create(), so
   // check existence before doing any of that heavier work.
-  const positionAccount = await conn.getAccountInfo(positionPubkey);
+  const positionAccount = await withTimeout(
+    conn.getAccountInfo(positionPubkey),
+    15_000,
+    "getAccountInfo",
+  );
   if (!positionAccount) {
     throw new Error(`Position ${position.publicKey.slice(0, 8)} not found on-chain — already closed or datapi stale`);
   }
 
-  const lbPair = await DLMM.create(conn, new PublicKey(poolAddress));
+  const lbPair = await withTimeout(DLMM.create(conn, poolPubkey), 20_000, "DLMM.create");
 
   // Remove 100% (10000 bps), claim all fees, and close the position account.
   // Retry up to 3× — each attempt gets a fresh transaction (new blockhash) from
@@ -219,7 +269,7 @@ export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, po
   let lowerBinId = position.lowerBinId;
   let upperBinId = position.upperBinId;
   if (lowerBinId == null || upperBinId == null) {
-    const onChainPos = await lbPair.getPosition(positionPubkey);
+    const onChainPos = await withTimeout(lbPair.getPosition(positionPubkey), 20_000, "getPosition");
     lowerBinId = onChainPos.positionData.lowerBinId;
     upperBinId = onChainPos.positionData.upperBinId;
   }
@@ -227,23 +277,46 @@ export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, po
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const txs = await lbPair.removeLiquidity({
-        user:              keypair.publicKey,
-        position:          positionPubkey,
-        fromBinId:         lowerBinId,
-        toBinId:           upperBinId,
-        bps:               new BN(10000),
-        shouldClaimAndClose: true,
-      });
+      const txs = await withTimeout(
+        lbPair.removeLiquidity({
+          user:              keypair.publicKey,
+          position:          positionPubkey,
+          fromBinId:         lowerBinId,
+          toBinId:           upperBinId,
+          bps:               new BN(10000),
+          shouldClaimAndClose: true,
+        }),
+        20_000,
+        "removeLiquidity",
+      );
 
       // removeLiquidity may return a single Transaction or an array.
       const txList = Array.isArray(txs) ? txs : [txs];
+
+      // The SDK builds this tx with no priority fee at all, which is what let
+      // it sit unconfirmed until blockhash expiry under congestion. Prepend a
+      // dynamic priority fee (Helius estimate, clamped) to each tx so it's
+      // actually competitive for block inclusion.
+      const priorityFee = await getPriorityFeeMicroLamports(
+        rpcUrl,
+        [poolPubkey.toBase58(), positionPubkey.toBase58()],
+        config.withdrawPriorityFee,
+      );
+      const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee });
+      for (const tx of txList) {
+        tx.instructions.unshift(priorityIx);
+      }
+
       let lastSig = null;
       for (const tx of txList) {
-        lastSig = await sendAndConfirmTransaction(conn, tx, [keypair], {
-          commitment:    "confirmed",
-          skipPreflight: true,
-        });
+        lastSig = await withTimeout(
+          sendAndConfirmTransaction(conn, tx, [keypair], {
+            commitment:    "confirmed",
+            skipPreflight: true,
+          }),
+          45_000,
+          "sendAndConfirmTransaction",
+        );
       }
       return lastSig;
     } catch (e) {
@@ -259,7 +332,10 @@ export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, po
       if (msg.includes("custom program error") || msg.includes("Error processing Instruction")) {
         break;
       }
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000 * attempt));
+      // With a priority fee now in play, most withdraws land on the first
+      // attempt — this backoff only exists as a brief cooldown before retrying
+      // after a transient failure, not to wait out congestion.
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 1000 * attempt));
     }
   }
   throw lastErr;

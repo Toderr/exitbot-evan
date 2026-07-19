@@ -48,6 +48,25 @@ export const config = {
   // failures — surfaced to Telegram, must be closed manually after that.
   maxCloseFailures: 4,
 
+  // Priority fee for the withdraw (removeLiquidity) transaction. The DLMM SDK
+  // builds this tx with no priority fee at all, so under network congestion it
+  // can sit unconfirmed until its blockhash expires (~60-90s) and has to be
+  // retried from scratch — this is what made withdrawals slow/appear stuck.
+  // Fetched dynamically per attempt from Helius's getPriorityFeeEstimate,
+  // clamped to [floorMicroLamports, capMicroLamports]; falls back to the floor
+  // if the estimate call fails or the RPC doesn't support the method.
+  withdrawPriorityFee: {
+    floorMicroLamports: 20_000,
+    capMicroLamports: 1_000_000,
+  },
+
+  // Watchdog for the 15s cron tick. A legitimate close (withdraw retries +
+  // swap fallback retries) can take up to a couple minutes, so this must sit
+  // above that — but a tick stuck past this is treated as hung (e.g. an RPC
+  // call that never resolves) and force-recovered so the cron isn't blocked
+  // forever. See index.js.
+  tickWatchdogMs: 240_000, // 4 min
+
   stateFile: "./state/positions.json",
   journalFile: "./state/journal.jsonl",
   pendingScanFile: "./state/pending-scan.json",

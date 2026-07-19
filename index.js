@@ -16,12 +16,31 @@ import bot from "./telegram.js";
 const ONCE = process.argv.includes("--once");
 
 let tickRunning = false;
+let currentTickId = 0;
+
+// A hung RPC call inside runExitCheck() (no built-in Solana RPC timeout) used
+// to leave tickRunning stuck `true` forever, silently freezing every future
+// tick. This watchdog force-recovers after config.tickWatchdogMs so a stall
+// is bounded instead of permanent. tickId guards against the original,
+// eventually-settling promise clobbering a *later* tick's state once the
+// watchdog has already unblocked the cron.
 async function tick() {
   if (tickRunning) {
     log("main", "Exit-check tick still running — skipping overlapping tick");
     return;
   }
   tickRunning = true;
+  const tickId = ++currentTickId;
+
+  const watchdog = setTimeout(() => {
+    if (tickId !== currentTickId) return;
+    log("main_error", `Exit-check tick stuck for over ${config.tickWatchdogMs}ms — forcing recovery so future ticks resume`);
+    bot.sendMessage(
+      `🚨 exitbot-evan: exit-check tick stuck for over ${config.tickWatchdogMs / 1000}s (hung RPC call) — forced recovery. Run /status and verify on-chain state for whatever position was being closed.`,
+    ).catch(() => {});
+    tickRunning = false;
+  }, config.tickWatchdogMs);
+
   try {
     const result = await runExitCheck();
     if (result.positions > 0) {
@@ -32,7 +51,8 @@ async function tick() {
     console.error(e);
     await bot.sendMessage(`🚨 exitbot-evan ERROR:\n${e.message}`);
   } finally {
-    tickRunning = false;
+    clearTimeout(watchdog);
+    if (tickId === currentTickId) tickRunning = false;
   }
 }
 
