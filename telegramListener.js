@@ -210,8 +210,18 @@ async function handleIndicatorPick(positionAddress, chatId, messageId) {
 function describeIndicatorAdoption(entry) {
   const ind = config.indicatorExit ?? {};
   const tf = ind.timeframeMinutes ?? 15;
-  const slPart = entry.slEnabled ? `SL ${entry.stopLossPct}%` : "SL off";
-  const oorPart = (ind.keepOorClose ?? true) && config.oorCloseEnabled ? " · OOR close on" : "";
+  const oorOn = (ind.keepOorClose ?? true) && config.oorCloseEnabled;
+  let slPart, oorPart;
+  if (entry.slEnabled) {
+    slPart = `SL ${entry.stopLossPct}%`;
+    oorPart = oorOn ? " · OOR close on" : "";
+  } else {
+    slPart = "SL off";
+    // No SL chosen: a downside break no longer auto-closes (that's what
+    // declining SL means) — only alerts. OOR-above (a runaway favorable
+    // move) still closes as normal.
+    oorPart = oorOn ? " · OOR-above still auto-closes; OOR-below alerts only, won't close" : "";
+  }
   return `📈 Now managing ${entry.symbol} (${entry.positionAddress.slice(0, 6)}…) with Indicator Exit — ` +
     `RSI(${ind.rsiPeriod ?? 2}) > ${ind.rsiThreshold ?? 90} on ${tf}m AND (MACD first green histogram OR close > upper BB). ` +
     `${slPart}${oorPart}.`;

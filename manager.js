@@ -293,6 +293,10 @@ export async function adoptCandidate(positionAddress, overrides = {}) {
     highTvlMode: false,
     runnerMode: false,
     touchedMinus5: false,
+    // Indicator Exit + no SL: tracks whether the "price broke below range"
+    // alert has already fired for the current below-range episode, so it
+    // doesn't re-send every 15s tick — resets once price is back in range.
+    oorBelowAlerted: false,
     closeFailCount: 0,
   };
 
@@ -880,7 +884,30 @@ export async function runExitCheck() {
       }
     }
 
-    if (!closeReason && snap.oor && oorEnabled) {
+    // Indicator Exit positions that declined a Stop Loss don't auto-close on
+    // a downside break either — that's what "no stop loss" means. They still
+    // auto-close on OOR *above* (a runaway favorable move) same as any other
+    // position; a one-time Telegram alert fires instead the moment price
+    // first breaks below the range, so it isn't silently left unmonitored.
+    const suppressOorBelowClose = indicatorMode && !slEnabled;
+
+    if (suppressOorBelowClose) {
+      if (snap.oorBelow && !entry.oorBelowAlerted) {
+        entry.oorBelowAlerted = true;
+        positions[entry.positionAddress] = entry;
+        log("manager", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}) — price broke below range, no SL set — alerting only, not closing`);
+        await bot.sendHTML(
+          `⚠️ <b>Price Below Range</b> — <b>${esc(entry.symbol)}</b> (<code>${esc(entry.positionAddress.slice(0, 8))}…</code>)\n` +
+          `Active price dropped below the position's lower bin. No Stop Loss is set for this Indicator Exit position, so it will <b>not</b> auto-close — review manually.\n` +
+          `PnL: ${fmtPct(snap.pnlPct)} · ${fmtUsd(snap.pnlUsd)}`,
+        );
+      } else if (!snap.oorBelow && entry.oorBelowAlerted) {
+        entry.oorBelowAlerted = false;
+        positions[entry.positionAddress] = entry;
+      }
+    }
+
+    if (!closeReason && snap.oor && oorEnabled && !(suppressOorBelowClose && snap.oorBelow)) {
       closeReason = "OOR (out of range)";
     }
 
@@ -921,7 +948,8 @@ export async function statusText() {
       : `${entry.stopLossPct}%`;
     const tpSlDetail = indicatorMode
       ? `📈 Indicator Exit (RSI${config.indicatorExit?.rsiPeriod ?? 2}&gt;${config.indicatorExit?.rsiThreshold ?? 90} + MACD/BB, ${config.indicatorExit?.timeframeMinutes ?? 15}m) / SL ${slPart}` +
-        `${entry.slMode && entry.slMode !== "pnl" ? ` (mode: ${entry.slMode})` : ""}`
+        `${entry.slMode && entry.slMode !== "pnl" ? ` (mode: ${entry.slMode})` : ""}` +
+        `${entry.oorBelowAlerted ? " (⚠️ below range — not closing, no SL)" : ""}`
       : `+${entry.takeProfitPct}% / ${entry.stopLossPct}%` +
         `${entry.slMode && entry.slMode !== "pnl" ? ` (mode: ${entry.slMode})` : ""}` +
         `${entry.customTpSl ? " (custom)" : ""}` +
