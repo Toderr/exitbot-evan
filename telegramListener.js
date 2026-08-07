@@ -39,6 +39,9 @@ function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").
 const HELP_TEXT =
   "<b>exitbot-evan</b>\n" +
   "/scan — scan wallet on-chain for DLMM positions; pick which ones to manage from the button list\n" +
+  "   exit presets per position: default TP/SL · custom TP/SL · 📈 Indicator Exit " +
+  "(15m RSI(2)&gt;90 AND (MACD first green histogram OR close &gt; upper Bollinger) — " +
+  "SL is opt-in with your own percent, OOR still applies)\n" +
   "/status — list currently managed positions\n" +
   "/stop — pick a managed position to stop managing (or stop ALL managed positions)\n" +
   "/forget &lt;positionAddress&gt; — stop managing a position without closing it\n" +
@@ -100,12 +103,29 @@ function buildPickerKeyboard(candidates) {
   return { inline_keyboard: rows };
 }
 
-// Step 2: default-vs-custom choice for one specific candidate.
+// Step 2: exit-preset choice for one specific candidate — default TP/SL,
+// custom TP/SL, or Indicator Exit (15m RSI/MACD/Bollinger instead of a PnL
+// take-profit; SL/OOR still apply).
 function buildDefaultOrCustomKeyboard(positionAddress) {
+  const ind = config.indicatorExit ?? {};
   return {
     inline_keyboard: [
       [{ text: `✅ Use default (TP +${config.takeProfitPct}% / SL ${config.stopLossPct}%)`, callback_data: `adoptdefault:${positionAddress}` }],
       [{ text: "⚙️ Set custom TP/SL", callback_data: `customtp:${positionAddress}` }],
+      [{ text: `📈 Indicator Exit (RSI${ind.rsiPeriod ?? 2}>${ind.rsiThreshold ?? 90} + MACD/BB ${ind.timeframeMinutes ?? 15}m)`, callback_data: `indicatorpick:${positionAddress}` }],
+    ],
+  };
+}
+
+// Step 2b: once Indicator Exit is picked, SL is opt-in — ask whether to add
+// one at all before asking for the percent (kept as two taps/one text reply
+// rather than folding "percent, or blank for none" into a single prompt, so
+// declining SL doesn't require typing anything).
+function buildIndicatorSlKeyboard(positionAddress) {
+  return {
+    inline_keyboard: [
+      [{ text: "🛡️ Add Stop Loss", callback_data: `indicatorsl:${positionAddress}` }],
+      [{ text: "🚫 No Stop Loss (indicator exit only)", callback_data: `indicatornosl:${positionAddress}` }],
     ],
   };
 }
@@ -154,7 +174,7 @@ async function handleScan() {
   const blocks = [
     `<p>${plainLines.join("<br/>")}</p>`,
     ...candidates.map((c, i) => describeCandidate(c, i)),
-    "<p>Tap a position to choose default or custom TP/SL:</p>",
+    "<p>Tap a position to choose its exit preset (default TP/SL, custom TP/SL, or Indicator Exit):</p>",
   ];
   await bot.sendRichHTML(blocks.join("\n\n"), { replyMarkup: buildPickerKeyboard(candidates) });
 }
@@ -174,6 +194,56 @@ async function handleAdoptDefault(positionAddress) {
   const entry = await adoptCandidate(positionAddress);
   if (!entry) return { ok: false, text: "That candidate is no longer pending — try /scan again." };
   return { ok: true, text: `✅ Now managing ${entry.symbol} (${positionAddress.slice(0, 6)}…) — TP +${entry.takeProfitPct}% / SL ${entry.stopLossPct}%.` };
+}
+
+async function handleIndicatorPick(positionAddress, chatId, messageId) {
+  const candidate = getPendingCandidate(positionAddress);
+  if (!candidate) return { text: "That candidate is no longer pending — try /scan again." };
+  await bot.editMessageText(
+    chatId, messageId,
+    `<b>${esc(candidate.symbol)}</b> — Indicator Exit selected. Add a Stop Loss too?`,
+    { replyMarkup: buildIndicatorSlKeyboard(positionAddress) },
+  );
+  return { text: "Choose whether to add a Stop Loss." };
+}
+
+function describeIndicatorAdoption(entry) {
+  const ind = config.indicatorExit ?? {};
+  const tf = ind.timeframeMinutes ?? 15;
+  const slPart = entry.slEnabled ? `SL ${entry.stopLossPct}%` : "SL off";
+  const oorPart = (ind.keepOorClose ?? true) && config.oorCloseEnabled ? " · OOR close on" : "";
+  return `📈 Now managing ${entry.symbol} (${entry.positionAddress.slice(0, 6)}…) with Indicator Exit — ` +
+    `RSI(${ind.rsiPeriod ?? 2}) > ${ind.rsiThreshold ?? 90} on ${tf}m AND (MACD first green histogram OR close > upper BB). ` +
+    `${slPart}${oorPart}.`;
+}
+
+async function handleAdoptIndicatorNoSl(positionAddress) {
+  const entry = await adoptCandidate(positionAddress, { exitMode: "indicator", indicatorSlEnabled: false });
+  if (!entry) return { ok: false, text: "That candidate is no longer pending — try /scan again." };
+  return { ok: true, text: describeIndicatorAdoption(entry) };
+}
+
+async function handleIndicatorSlPrompt(positionAddress, chatId, messageId) {
+  const candidate = getPendingCandidate(positionAddress);
+  if (!candidate) return { text: "That candidate is no longer pending — try /scan again." };
+  setAwaitingCustom(positionAddress, "indicatorSl");
+  await bot.editMessageText(
+    chatId, messageId,
+    `<b>${esc(candidate.symbol)}</b> — send your Stop Loss as a negative number, e.g. <code>-6</code> ` +
+    `for -6% PnL. Send /cancel to abort.`,
+  );
+  return { text: "Waiting for your SL number…" };
+}
+
+async function handleIndicatorSlReply(positionAddress, text) {
+  const sl = Number(text.trim());
+  if (!Number.isFinite(sl)) return { ok: false, text: "Couldn't parse that. Send a negative number like -6, or /cancel." };
+  if (sl >= 0) return { ok: false, text: "SL must be a negative number (e.g. -6 for -6%)." };
+
+  const entry = await adoptCandidate(positionAddress, { exitMode: "indicator", indicatorSlEnabled: true, stopLossPct: sl });
+  clearAwaitingCustom();
+  if (!entry) return { ok: true, text: "That candidate is no longer pending — try /scan again." };
+  return { ok: true, text: describeIndicatorAdoption(entry) };
 }
 
 async function handleCustomTpPrompt(positionAddress, chatId, messageId) {
@@ -268,6 +338,16 @@ export function startListener() {
                 result = await handleAdoptDefault(data.slice("adoptdefault:".length));
                 await bot.answerCallbackQuery(cq.id, { text: result.text });
                 if (result.ok) await bot.editMessageText(chat, msgId, esc(result.text));
+              } else if (data.startsWith("indicatorpick:")) {
+                result = await handleIndicatorPick(data.slice("indicatorpick:".length), chat, msgId);
+                await bot.answerCallbackQuery(cq.id, { text: result.text });
+              } else if (data.startsWith("indicatornosl:")) {
+                result = await handleAdoptIndicatorNoSl(data.slice("indicatornosl:".length));
+                await bot.answerCallbackQuery(cq.id, { text: result.text.slice(0, 190) });
+                if (result.ok) await bot.editMessageText(chat, msgId, esc(result.text));
+              } else if (data.startsWith("indicatorsl:")) {
+                result = await handleIndicatorSlPrompt(data.slice("indicatorsl:".length), chat, msgId);
+                await bot.answerCallbackQuery(cq.id, { text: result.text });
               } else if (data.startsWith("customtp:")) {
                 result = await handleCustomTpPrompt(data.slice("customtp:".length), chat, msgId);
                 await bot.answerCallbackQuery(cq.id, { text: result.text });
@@ -296,15 +376,18 @@ export function startListener() {
 
           const text = msg.text.trim();
 
-          // A custom-TP/SL prompt takes priority over command parsing, except
-          // /cancel and /scan (starting over should always be possible).
-          const awaitingPositionAddress = getAwaitingCustom();
-          if (awaitingPositionAddress && text !== "/cancel" && !text.startsWith("/scan")) {
+          // A custom-TP/SL or indicator-SL prompt takes priority over command
+          // parsing, except /cancel and /scan (starting over should always be
+          // possible).
+          const awaiting = getAwaitingCustom();
+          if (awaiting && text !== "/cancel" && !text.startsWith("/scan")) {
             try {
-              const result = await handleCustomTpSlReply(awaitingPositionAddress, text);
+              const result = awaiting.kind === "indicatorSl"
+                ? await handleIndicatorSlReply(awaiting.positionAddress, text)
+                : await handleCustomTpSlReply(awaiting.positionAddress, text);
               await bot.sendMessage(result.text);
             } catch (e) {
-              log("listener_error", `custom TP/SL handling failed: ${e.message}`);
+              log("listener_error", `custom reply handling failed: ${e.message}`);
               await bot.sendMessage(`❌ Error: ${e.message}`);
             }
             continue;
@@ -338,7 +421,7 @@ export function startListener() {
               await bot.sendMessage(ok ? `Stopped managing ${positionAddress.slice(0, 8)}… (position left untouched on-chain).` : "Position not found in managed positions.");
             }
           } else if (cmd === "/cancel") {
-            if (awaitingPositionAddress) {
+            if (awaiting) {
               clearAwaitingCustom();
               await bot.sendMessage("Cancelled. Send /scan to try again.");
             } else {

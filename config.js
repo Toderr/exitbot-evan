@@ -44,6 +44,42 @@ export const config = {
     tightenedTpPct: 0.1,
   },
 
+  // Indicator Exit preset — third option in the /scan picker (alongside
+  // "default TP/SL" and "custom TP/SL"). Replaces the PnL take-profit with a
+  // 15m momentum-exhaustion signal:
+  //   RSI(2) close > 90  AND  (MACD first green histogram OR close > upper BB)
+  // Indicator Exit only takes over the profit-taking side — SL is opt-in per
+  // position (chosen at adoption time via the /scan picker, with a
+  // user-chosen percent), not a global toggle here. OOR close still applies
+  // unless disabled below. The high-TVL guard and runner alert never touch an
+  // indicator-exit position (they only adjust TP, which is unused in this
+  // mode).
+  indicatorExit: {
+    timeframeMinutes: 15,   // GeckoTerminal OHLCV aggregate
+    rsiPeriod: 2,
+    rsiThreshold: 90,       // RSI must close strictly above this (gate)
+    macdFast: 12,
+    macdSlow: 26,
+    macdSignal: 9,
+    // 1 = the histogram must flip green on the evaluated candle itself
+    // ("first green bar"). Raise it to let a cross that happened up to N
+    // candles ago still count, as long as the histogram stayed green since.
+    macdCrossLookbackCandles: 1,
+    // Histogram values within this fraction of price are treated as zero —
+    // on a barely-moving pool the raw histogram lands on float noise (±1e-15)
+    // whose sign flips would otherwise read as fresh "first green" bars.
+    histEpsilonRel: 1e-6,
+    bbPeriod: 20,
+    bbStdDev: 2,
+    // Evaluate the last *closed* 15m candle. The still-forming bucket is
+    // dropped — RSI/MACD/BB are all close-based signals, and an in-progress
+    // bar flip-flops. Set false to react to the forming candle instead.
+    useClosedCandlesOnly: true,
+    candleLimit: 100,       // enough history for MACD(26,9) + BB(20)
+    ohlcvCacheSec: 60,      // per-pool candle cache (GeckoTerminal: 30 req/min)
+    keepOorClose: true,     // OOR still closes an indicator-exit position
+  },
+
   // Give up auto-closing a position after this many consecutive withdraw
   // failures — surfaced to Telegram, must be closed manually after that.
   maxCloseFailures: 4,

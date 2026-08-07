@@ -45,7 +45,9 @@ reuse evilpanda-screener's tokens, so alerts/commands stay separated.
    snapshot from DexScreener (for the high-TVL guard). Only tapped positions
    get managed — anything you don't pick is left alone. Each position is
    tracked and closed independently, even when two share a pool.
-3. Every 15 seconds (`config.cronSchedule`), for each *managed* position:
+3. Tapping a position offers three **exit presets**: default TP/SL, custom
+   TP/SL (type `TP SL [slMode]`), or **📈 Indicator Exit** — see below.
+4. Every 15 seconds (`config.cronSchedule`), for each *managed* position:
    fetch PnL/range from the Meteora datapi (`fetchDlmmPnl`), apply the
    high-TVL guard, and check SL/TP/OOR. On trigger: withdraw the position,
    swap the token side to SOL (Jupiter, Meteora fallback), log to
@@ -55,7 +57,7 @@ reuse evilpanda-screener's tokens, so alerts/commands stay separated.
    (`positionAccountExists`) — if it's genuinely gone (e.g. closed manually
    outside the bot), it's auto-forgotten with a Telegram notification
    instead of being silently checked forever.
-4. `/scan` again any time you open a new position manually — it'll show up
+5. `/scan` again any time you open a new position manually — it'll show up
    as a new button (already-managed ones won't re-appear).
 
 No continuous RPC polling happens outside of a `/scan` call or a managed
@@ -94,11 +96,51 @@ its older README figures):
 These are independent of evilpanda-screener's config — update both if you
 want them to stay in sync.
 
+## Indicator Exit preset (`config.indicatorExit`)
+
+Third option in the /scan picker, alongside default and custom TP/SL. It
+**replaces the PnL take-profit** with a 15m momentum-exhaustion signal read
+off GeckoTerminal OHLCV — both conditions must hold on the same candle:
+
+1. **Gate** — RSI(2) on the 15m timeframe closes above 90 (Wilder smoothing,
+   the same formulation TradingView uses; at period 2 the smoothing choice
+   changes the number materially).
+2. **AND** either:
+   - MACD(12,26,9) on 15m prints its *first green histogram bar* — the
+     histogram crossing up through zero ("golden cross"), or
+   - the 15m close is above the upper Bollinger Band (20, 2σ).
+
+After picking Indicator Exit, the bot asks whether to add a Stop Loss —
+declining leaves the indicator as the sole exit trigger (besides OOR);
+accepting prompts for the SL percent as a plain-text reply (e.g. `-6` for
+-6% PnL), stored per position, not a global config value.
+
+Notes:
+- **SL is opt-in per position, OOR still applies.** Turn OOR off for this mode
+  with `indicatorExit.keepOorClose` if you want the indicator (plus your
+  chosen SL, if any) to be the sole exit.
+- The high-TVL guard and runner alert never touch an indicator-exit position
+  (both only adjust TP, which is unused here).
+- Only the last **closed** 15m candle is evaluated — the still-forming bucket
+  is dropped (`useClosedCandlesOnly`), since RSI/MACD/BB are close-based and
+  an in-progress bar flip-flops. Set it to `false` to react to the forming
+  candle instead.
+- `macdCrossLookbackCandles` (default 1) means the histogram must flip green
+  on the evaluated bar itself. Raise it to let a cross from up to N bars ago
+  still count, provided the histogram stayed green since.
+- Histogram values within `histEpsilonRel` × price (default 1e-6) are treated
+  as zero — on a barely-moving pool the raw histogram sits on float noise
+  (±1e-15) whose sign flips would otherwise read as fresh "first green" bars.
+- Candles are cached per pool for `ohlcvCacheSec` (60s) — the tick runs every
+  15s and GeckoTerminal's free tier allows 30 req/min.
+- Positions adopted before this preset existed have no `exitMode` field and
+  are treated as `"pnl"` — behavior unchanged.
+
 ## Telegram commands
 
 | Command | Effect |
 |---|---|
-| `/scan` | Enumerate wallet on-chain, show a button per new SOL-quoted position (one per position, not per pool) to pick which to manage |
+| `/scan` | Enumerate wallet on-chain, show a button per new SOL-quoted position (one per position, not per pool) to pick which to manage, then pick its exit preset (default TP/SL · custom TP/SL · Indicator Exit) |
 | `/status` | List currently managed positions + their TP/SL |
 | `/stop` | Show a picker: stop managing one specific position, or "Stop ALL" to stop managing every currently managed position (each left untouched on-chain) — the bot itself and its 15s cron keep running |
 | `/forget <positionAddress>` | Stop managing a position directly by address (does not close it on-chain) |
@@ -113,6 +155,8 @@ transactions).
 index.js              — entry point (listener + 15s cron)
 config.js              — thresholds
 manager.js              — /scan candidate discovery, adoption, snapshot, high-TVL guard, SL/TP/OOR close
+indicators.js            — pure RSI / EMA / MACD / Bollinger math (no I/O)
+indicatorExit.js          — Indicator Exit preset: 15m candle fetch + cache, criteria evaluation
 telegramListener.js     — command + inline-keyboard long-poll (/scan picker, /status /stop /forget /help)
 telegram.js             — HTML sender + getUpdates
 logger.js               — file + console logger (logs/exitbot-YYYY-MM-DD.log)

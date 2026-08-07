@@ -31,6 +31,7 @@ import {
 import { swapAllToSolFromKey } from "./api/jupiter.js";
 import { fetchMarketCap } from "./api/dexscreener.js";
 import { fetchOhlcv } from "./api/geckoterminal.js";
+import { evaluateIndicatorExit, summarizeIndicators } from "./indicatorExit.js";
 import bot from "./telegram.js";
 import { renderPnlCard } from "./pnlCard.js";
 import { card } from "./richCard.js";
@@ -98,25 +99,68 @@ function savePending(pending) {
 }
 
 // Infer the deposit shape (Spot/Curve/Bid-Ask) from per-bin liquidity, since
-// it isn't stored anywhere after the fact — heuristic, not authoritative:
-// compares average liquidity in the outer thirds of the range vs the middle
-// third. Curve = center-weighted, Bid-Ask = edge-weighted, Spot = flat.
+// it isn't stored anywhere after the fact — heuristic, not authoritative.
+//
+// A single-sided/skewed position (deposited mostly or entirely on one side of
+// the entry price, common for a manually-opened position) produces a
+// monotonic ramp in per-bin liquidity, not a symmetric bowl or bump. The
+// naive "average the two outer thirds vs the middle third" test used to be
+// the *whole* algorithm, and it has a blind spot there: for any perfectly
+// linear sequence, the average of the two outer thirds combined is
+// mathematically equal to the average of the middle third (that's just what
+// a straight line's mean does), so a real Bid-Ask deposit skewed to one side
+// always read as flat under that test alone — confirmed against a live
+// position whose per-bin liquidity was a near-perfect linear ramp down to
+// zero, misclassified as "Spot (flat)".
+//
+// Fix: fit a straight line through the per-bin liquidity first. A strong,
+// near-perfect linear trend (R² close to 1) *is* an edge-weighted deposit,
+// just skewed to one side rather than symmetric — Meteora's Bid-Ask weight
+// is distance-from-center-based, which collapses to one straight segment
+// when the position only covers one side of that center. Only when the data
+// isn't well explained by a line do we fall back to comparing outer-thirds
+// vs middle-third — now on the *residual* after removing that line, so a
+// sloped-but-curved deposit (a skewed Curve, or a two-sided Bid-Ask/Curve
+// whose center isn't exactly mid-range) isn't swallowed by its own trend.
 function classifyShape(positionBinData) {
   const bins = (positionBinData ?? []).slice().sort((a, b) => a.binId - b.binId);
-  if (bins.length < 3) return "Spot";
+  if (bins.length < 5) return "Spot";
 
+  // Values run up to ~1e27+ (raw on-chain liquidity units) — Number loses
+  // precision at that magnitude but shape classification only needs relative
+  // proportions, not exact amounts, so the precision loss doesn't matter here.
   const liq = bins.map((b) => {
-    try { return BigInt(b.positionLiquidity || "0"); } catch { return 0n; }
+    try { return Number(BigInt(b.positionLiquidity || "0")); } catch { return 0; }
   });
-  const third = Math.max(1, Math.floor(liq.length / 3));
-  const avg = (arr) => (arr.length === 0 ? 0n : arr.reduce((a, b) => a + b, 0n) / BigInt(arr.length));
+  const n = liq.length;
+  const maxLiq = Math.max(...liq);
+  const minLiq = Math.min(...liq);
+  if (maxLiq <= 0 || (maxLiq - minLiq) / maxLiq < 0.1) return "Spot (flat)";
 
-  const edgeAvg = avg([...liq.slice(0, third), ...liq.slice(-third)]);
-  const midAvg = avg(liq.slice(third, liq.length - third));
+  // Least-squares line through (bin index, liquidity).
+  const meanX = (n - 1) / 2;
+  const meanY = liq.reduce((s, v) => s + v, 0) / n;
+  let sxy = 0, sxx = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = i - meanX;
+    sxy += dx * (liq[i] - meanY);
+    sxx += dx * dx;
+  }
+  const slope = sxx === 0 ? 0 : sxy / sxx;
+  const intercept = meanY - slope * meanX;
+  const fitted = liq.map((_, i) => intercept + slope * i);
+  const rampSpan = Math.abs(slope) * (n - 1); // total rise/fall the fitted line implies
 
-  if (edgeAvg === 0n && midAvg === 0n) return "Spot";
-  if (midAvg > edgeAvg * 13n / 10n) return "Curve (center-weighted)";
-  if (edgeAvg > midAvg * 13n / 10n) return "Bid-Ask (edge-weighted)";
+  const residual = liq.map((v, i) => v - fitted[i]);
+  const third = Math.max(1, Math.floor(n / 3));
+  const avg = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const edgeAvg = avg([...residual.slice(0, third), ...residual.slice(-third)]);
+  const midAvg = avg(residual.slice(third, n - third));
+  const scale = maxLiq - minLiq;
+
+  if (edgeAvg - midAvg > scale * 0.08) return "Bid-Ask (edge-weighted)";
+  if (midAvg - edgeAvg > scale * 0.08) return "Curve (center-weighted)";
+  if (rampSpan / maxLiq > 0.3) return "Bid-Ask (edge-weighted, single-sided ramp)";
   return "Spot (flat)";
 }
 
@@ -194,14 +238,27 @@ export async function scanOnChain(rpcUrl, walletAddress) {
 // Adopt one previously-scanned candidate into management (called from a
 // Telegram button tap). `overrides` optionally sets custom TP/SL instead of
 // config defaults — used when the user picks "Set Custom TP/SL" instead of
-// "Use Default" during the /scan picker flow. Returns the new entry, or null
-// if it's no longer pending.
+// "Use Default" during the /scan picker flow — or `exitMode: "indicator"` for
+// the Indicator Exit preset, which replaces the PnL take-profit with the 15m
+// RSI/MACD/Bollinger signal (see indicatorExit.js). For indicator mode, SL is
+// opt-in per position: `overrides.indicatorSlEnabled` (bool) plus
+// `overrides.stopLossPct` (the percent, only read when enabled) — unlike pnl
+// mode, where SL always applies at either a custom or config-default percent.
+// Returns the new entry, or null if it's no longer pending.
 export async function adoptCandidate(positionAddress, overrides = {}) {
   const pending = loadPending();
   const candidate = pending[positionAddress];
   if (!candidate) return null;
 
   const entryMcap = await fetchMarketCap(candidate.baseMint).catch(() => null);
+  const exitMode = overrides.exitMode === "indicator" ? "indicator" : "pnl";
+  const isIndicator = exitMode === "indicator";
+
+  const slEnabled = isIndicator ? overrides.indicatorSlEnabled === true : true;
+  const stopLossPct = isIndicator
+    ? (slEnabled && Number.isFinite(overrides.stopLossPct) ? overrides.stopLossPct : null)
+    : (Number.isFinite(overrides.stopLossPct) ? overrides.stopLossPct : config.stopLossPct);
+
   const entry = {
     poolAddress: candidate.poolAddress,
     positionAddress: candidate.positionAddress,
@@ -219,12 +276,19 @@ export async function adoptCandidate(positionAddress, overrides = {}) {
     // thresholds (custom or default) — the high-TVL guard tightens
     // takeProfitPct/stopLossPct temporarily but reverts to these, not to
     // config's global defaults, so a custom TP/SL survives a guard cycle.
+    // Unused for indicator-mode TP (that guard skips indicator positions).
     takeProfitPct: Number.isFinite(overrides.takeProfitPct) ? overrides.takeProfitPct : config.takeProfitPct,
-    stopLossPct: Number.isFinite(overrides.stopLossPct) ? overrides.stopLossPct : config.stopLossPct,
+    stopLossPct,
     baseTakeProfitPct: Number.isFinite(overrides.takeProfitPct) ? overrides.takeProfitPct : config.takeProfitPct,
-    baseStopLossPct: Number.isFinite(overrides.stopLossPct) ? overrides.stopLossPct : config.stopLossPct,
-    slMode: ["pnl", "oorBelow", "both"].includes(overrides.slMode) ? overrides.slMode : config.slMode,
-    customTpSl: Number.isFinite(overrides.takeProfitPct) || Number.isFinite(overrides.stopLossPct),
+    baseStopLossPct: stopLossPct,
+    slMode: isIndicator ? "pnl" : (["pnl", "oorBelow", "both"].includes(overrides.slMode) ? overrides.slMode : config.slMode),
+    // "pnl" (default/custom TP/SL) or "indicator" (15m RSI/MACD/BB signal
+    // replaces the take-profit; SL/OOR unchanged).
+    exitMode,
+    // Whether SL is active at all — always true for pnl mode; a per-position
+    // opt-in choice for indicator mode (stopLossPct is null when declined).
+    slEnabled,
+    customTpSl: !isIndicator && (Number.isFinite(overrides.takeProfitPct) || Number.isFinite(overrides.stopLossPct)),
     entryMcap,
     highTvlMode: false,
     runnerMode: false,
@@ -251,19 +315,24 @@ export function getPendingCandidate(positionAddress) {
   return loadPending()[positionAddress] ?? null;
 }
 
-// ─── Awaiting-custom-TP/SL state ──────────────────────────────────────────
+// ─── Awaiting-custom-reply state ──────────────────────────────────────────
 // Single-slot: this is a one-user DM bot, so only one "waiting for the user
-// to type TP/SL numbers" prompt is ever outstanding at a time.
-
-export function setAwaitingCustom(positionAddress) {
+// to type a number" prompt is ever outstanding at a time. `kind` distinguishes
+// which flow the next plain-text reply belongs to — "customTpSl" (TP+SL for
+// the default/custom preset) or "indicatorSl" (just an SL percent, for the
+// Indicator Exit preset's opt-in stop loss).
+export function setAwaitingCustom(positionAddress, kind = "customTpSl") {
   fs.mkdirSync(path.dirname(config.awaitingCustomFile), { recursive: true });
-  fs.writeFileSync(config.awaitingCustomFile, JSON.stringify({ positionAddress }));
+  fs.writeFileSync(config.awaitingCustomFile, JSON.stringify({ positionAddress, kind }));
 }
 
 export function getAwaitingCustom() {
   if (!fs.existsSync(config.awaitingCustomFile)) return null;
-  try { return JSON.parse(fs.readFileSync(config.awaitingCustomFile, "utf8"))?.positionAddress ?? null; }
-  catch { return null; }
+  try {
+    const data = JSON.parse(fs.readFileSync(config.awaitingCustomFile, "utf8"));
+    if (!data?.positionAddress) return null;
+    return { positionAddress: data.positionAddress, kind: data.kind ?? "customTpSl" };
+  } catch { return null; }
 }
 
 export function clearAwaitingCustom() {
@@ -360,6 +429,7 @@ async function buildSnapshot(entry, walletAddress) {
 
 async function applyHighTvlGuard(entry, poolData) {
   if (entry.customTpSl) return;
+  if (entry.exitMode === "indicator") return; // no TP to tighten in this mode
   if (!(entry.entryMcap > 0)) return; // no MCap reference — guard can't evaluate
 
   const poolTvl = Number(poolData?.tvl) || null;
@@ -431,6 +501,7 @@ async function checkRunnerAlert(entry, poolData) {
   // custom TP/SL for this position made a deliberate choice that the runner
   // alert shouldn't silently override.
   if (entry.customTpSl) return;
+  if (entry.exitMode === "indicator") return; // no TP to bump in this mode
 
   if (entry.touchedMinus5) {
     if (entry.runnerMode) {
@@ -759,17 +830,27 @@ export async function runExitCheck() {
 
     let closeReason = null;
 
+    // Indicator Exit positions replace the PnL take-profit with the 15m
+    // RSI/MACD/Bollinger signal. SL is opt-in per position for indicator mode
+    // (chosen at adoption time via entry.slEnabled/stopLossPct) — always on
+    // for pnl mode. OOR close is still governed by config.indicatorExit.
+    const indicatorMode = entry.exitMode === "indicator";
+    const slEnabled = indicatorMode ? entry.slEnabled === true : true;
+    const oorEnabled = config.oorCloseEnabled
+      && (!indicatorMode || (config.indicatorExit?.keepOorClose ?? true));
+
     // SL evaluation mode — "pnl" (legacy default), "oorBelow" (fires on
     // downside OOR regardless of PnL%), or "both" (whichever hits first).
     // Independent of oorCloseEnabled below, which still closes on OOR in
-    // either direction regardless of slMode.
+    // either direction regardless of slMode. entry.stopLossPct is null when
+    // an indicator-mode position declined SL — pnlSlHit stays false then.
     const slMode = entry.slMode ?? config.slMode ?? "pnl";
-    const pnlSlHit = snap.pnlPct != null && snap.pnlPct <= entry.stopLossPct;
+    const pnlSlHit = entry.stopLossPct != null && snap.pnlPct != null && snap.pnlPct <= entry.stopLossPct;
     const oorBelowSlHit = snap.oorBelow === true;
-    const slHit =
+    const slHit = slEnabled && (
       slMode === "oorBelow" ? oorBelowSlHit :
       slMode === "both" ? (pnlSlHit || oorBelowSlHit) :
-      pnlSlHit;
+      pnlSlHit);
 
     if (slHit) {
       const n = (slBelowCount.get(entry.positionAddress) ?? 0) + 1;
@@ -784,12 +865,22 @@ export async function runExitCheck() {
       slBelowCount.delete(entry.positionAddress);
     }
 
-    const tpThreshold = entry.takeProfitPct * (1 - (config.tpTolerancePct ?? 0));
-    if (!closeReason && snap.pnlPct != null && snap.pnlPct >= tpThreshold) {
-      closeReason = `TP ${fmtPct(snap.pnlPct)} ≥ +${tpThreshold.toFixed(2)}% (target +${entry.takeProfitPct}%, -${((config.tpTolerancePct ?? 0) * 100).toFixed(0)}% tolerance)`;
+    if (!closeReason && indicatorMode) {
+      const verdict = await evaluateIndicatorExit(entry.poolAddress);
+      if (verdict.error) {
+        log("manager_warn", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}): indicator exit check skipped — ${verdict.error}`);
+      } else {
+        log("manager", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}) — ${summarizeIndicators(verdict.detail)}`);
+        if (verdict.triggered) closeReason = verdict.reason;
+      }
+    } else if (!closeReason) {
+      const tpThreshold = entry.takeProfitPct * (1 - (config.tpTolerancePct ?? 0));
+      if (snap.pnlPct != null && snap.pnlPct >= tpThreshold) {
+        closeReason = `TP ${fmtPct(snap.pnlPct)} ≥ +${tpThreshold.toFixed(2)}% (target +${entry.takeProfitPct}%, -${((config.tpTolerancePct ?? 0) * 100).toFixed(0)}% tolerance)`;
+      }
     }
 
-    if (!closeReason && snap.oor && config.oorCloseEnabled) {
+    if (!closeReason && snap.oor && oorEnabled) {
       closeReason = "OOR (out of range)";
     }
 
@@ -824,11 +915,18 @@ export async function statusText() {
       }
     }
 
-    const tpSlDetail = `+${entry.takeProfitPct}% / ${entry.stopLossPct}%` +
-      `${entry.slMode && entry.slMode !== "pnl" ? ` (mode: ${entry.slMode})` : ""}` +
-      `${entry.customTpSl ? " (custom)" : ""}` +
-      `${entry.highTvlMode ? " (high-TVL)" : ""}` +
-      `${entry.runnerMode ? " (🏃 runner)" : ""}`;
+    const indicatorMode = entry.exitMode === "indicator";
+    const slPart = indicatorMode
+      ? (entry.slEnabled === true && entry.stopLossPct != null ? `${entry.stopLossPct}%` : "off")
+      : `${entry.stopLossPct}%`;
+    const tpSlDetail = indicatorMode
+      ? `📈 Indicator Exit (RSI${config.indicatorExit?.rsiPeriod ?? 2}&gt;${config.indicatorExit?.rsiThreshold ?? 90} + MACD/BB, ${config.indicatorExit?.timeframeMinutes ?? 15}m) / SL ${slPart}` +
+        `${entry.slMode && entry.slMode !== "pnl" ? ` (mode: ${entry.slMode})` : ""}`
+      : `+${entry.takeProfitPct}% / ${entry.stopLossPct}%` +
+        `${entry.slMode && entry.slMode !== "pnl" ? ` (mode: ${entry.slMode})` : ""}` +
+        `${entry.customTpSl ? " (custom)" : ""}` +
+        `${entry.highTvlMode ? " (high-TVL)" : ""}` +
+        `${entry.runnerMode ? " (🏃 runner)" : ""}`;
 
     const rows = [
       row("Position", `<code>${esc(entry.positionAddress.slice(0, 8))}…</code>`),
