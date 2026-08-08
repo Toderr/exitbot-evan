@@ -262,12 +262,16 @@ async function handleCustomTpPrompt(positionAddress, chatId, messageId) {
   setAwaitingCustom(positionAddress);
   await bot.editMessageText(
     chatId, messageId,
-    `<b>${esc(candidate.symbol)}</b> — send your TP and SL as two numbers, e.g. <code>0.8 -6</code> ` +
-    `(TP +0.8%, SL -6%). TP must be positive, SL must be negative.\n` +
-    `Optionally add an SL mode as a 3rd word: <code>pnl</code> (default, SL by PnL% only), ` +
-    `<code>oorbelow</code> (SL fires as soon as price is out of range below the position, ` +
-    `regardless of PnL%), or <code>both</code> (whichever hits first) — e.g. <code>0.8 -6 both</code>.\n` +
-    `Send /cancel to abort.`,
+    `<b>${esc(candidate.symbol)}</b> — atur TP dan SL kamu\n\n` +
+    `Format: <code>TP SL [mode]</code>\n` +
+    `Contoh: <code>0.8 -6</code> → TP +0.8%, SL -6%\n` +
+    `(TP harus positif, SL harus negatif)\n\n` +
+    `Kata ke-3 opsional — mode SL:\n` +
+    `• <code>pnl</code> — SL berdasarkan PnL% saja (default)\n` +
+    `• <code>oorbelow</code> — SL langsung aktif begitu harga keluar dari range\n` +
+    `• <code>both</code> — mana yang lebih dulu tercapai\n` +
+    `Contoh: <code>0.8 -6 both</code>\n\n` +
+    `Kirim /cancel untuk membatalkan.`,
   );
   return { text: "Waiting for your TP/SL numbers…" };
 }
