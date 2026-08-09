@@ -869,6 +869,29 @@ export async function runExitCheck() {
       slBelowCount.delete(entry.positionAddress);
     }
 
+    // OOR-below never force-closes a position on its own — only slMode
+    // "oorBelow"/"both" treat it as a close trigger (handled above via
+    // oorBelowSlHit). Every other mode (including plain "pnl" SL and
+    // Indicator Exit) just gets a one-time alert on the downside break, since
+    // OOR-below alone isn't a signal those modes were configured to act on.
+    // OOR-above is unaffected and always closes via the generic check below.
+    const oorBelowHandledBySl = slEnabled && (slMode === "oorBelow" || slMode === "both");
+    if (!closeReason && snap.oorBelow && !oorBelowHandledBySl) {
+      if (!entry.oorBelowAlerted) {
+        entry.oorBelowAlerted = true;
+        positions[entry.positionAddress] = entry;
+        log("manager", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}) — price broke below range (slMode: ${slMode}) — alerting only, not closing`);
+        await bot.sendHTML(
+          `⚠️ <b>Price Below Range</b> — <b>${esc(entry.symbol)}</b> (<code>${esc(entry.positionAddress.slice(0, 8))}…</code>)\n` +
+          `Active price dropped below the position's lower bin. SL mode is <b>${esc(slMode)}</b>, which doesn't treat OOR-below as a close trigger, so it will <b>not</b> auto-close — review manually.\n` +
+          `PnL: ${fmtPct(snap.pnlPct)} · ${fmtUsd(snap.pnlUsd)}`,
+        );
+      }
+    } else if (!snap.oorBelow && entry.oorBelowAlerted) {
+      entry.oorBelowAlerted = false;
+      positions[entry.positionAddress] = entry;
+    }
+
     if (!closeReason && indicatorMode) {
       const verdict = await evaluateIndicatorExit(entry.poolAddress);
       if (verdict.error) {
@@ -884,30 +907,11 @@ export async function runExitCheck() {
       }
     }
 
-    // Indicator Exit positions that declined a Stop Loss don't auto-close on
-    // a downside break either — that's what "no stop loss" means. They still
-    // auto-close on OOR *above* (a runaway favorable move) same as any other
-    // position; a one-time Telegram alert fires instead the moment price
-    // first breaks below the range, so it isn't silently left unmonitored.
-    const suppressOorBelowClose = indicatorMode && !slEnabled;
-
-    if (suppressOorBelowClose) {
-      if (snap.oorBelow && !entry.oorBelowAlerted) {
-        entry.oorBelowAlerted = true;
-        positions[entry.positionAddress] = entry;
-        log("manager", `${entry.positionAddress.slice(0, 8)} (${entry.symbol}) — price broke below range, no SL set — alerting only, not closing`);
-        await bot.sendHTML(
-          `⚠️ <b>Price Below Range</b> — <b>${esc(entry.symbol)}</b> (<code>${esc(entry.positionAddress.slice(0, 8))}…</code>)\n` +
-          `Active price dropped below the position's lower bin. No Stop Loss is set for this Indicator Exit position, so it will <b>not</b> auto-close — review manually.\n` +
-          `PnL: ${fmtPct(snap.pnlPct)} · ${fmtUsd(snap.pnlUsd)}`,
-        );
-      } else if (!snap.oorBelow && entry.oorBelowAlerted) {
-        entry.oorBelowAlerted = false;
-        positions[entry.positionAddress] = entry;
-      }
-    }
-
-    if (!closeReason && snap.oor && oorEnabled && !(suppressOorBelowClose && snap.oorBelow)) {
+    // OOR *above* always closes (favorable break, no reason to hold off).
+    // OOR *below* only lands here — as an immediate close, same tick — when
+    // slMode explicitly treats it as a trigger (oorBelowHandledBySl above);
+    // otherwise it was already handled by the alert-only path.
+    if (!closeReason && snap.oor && oorEnabled && (snap.oorAbove || oorBelowHandledBySl)) {
       closeReason = "OOR (out of range)";
     }
 

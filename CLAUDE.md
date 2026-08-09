@@ -70,7 +70,12 @@ Mirrors evilpanda-screener's live `config.trader.*` (checked 2026-07-11, not
 its older README figures):
 - SL: -7% PnL
 - TP: +0.5% PnL
-- OOR: auto-close enabled (either direction — independent of SL mode below)
+- OOR *above* always auto-closes (favorable break, independent of SL mode).
+  OOR *below* only auto-closes when SL mode is `"oorBelow"` or `"both"`
+  (i.e. it's an explicit SL trigger) — for plain `"pnl"` mode (and Indicator
+  Exit), an OOR-below break sends a one-time Telegram alert instead and
+  leaves the position open, relying on the PnL threshold (or the indicator
+  signal) to decide the actual close.
 - SL mode (`config.slMode`, default `"pnl"`, overridable per-position via the
   /scan custom TP/SL flow): `"pnl"` fires SL only on PnL% ≤ threshold (legacy
   default); `"oorBelow"` fires SL as soon as price is out of range *below*
@@ -116,9 +121,10 @@ accepting prompts for the SL percent as a plain-text reply (e.g. `-6` for
 -6% PnL), stored per position, not a global config value.
 
 Notes:
-- **SL is opt-in per position, OOR still applies.** Turn OOR off for this mode
-  with `indicatorExit.keepOorClose` if you want the indicator (plus your
-  chosen SL, if any) to be the sole exit.
+- **SL is opt-in per position, OOR-above still applies** (OOR-below alerts
+  rather than closes, same as any other `"pnl"`-mode position — see above).
+  Turn OOR off entirely for this mode with `indicatorExit.keepOorClose` if you
+  want the indicator (plus your chosen SL, if any) to be the sole exit.
 - The high-TVL guard and runner alert never touch an indicator-exit position
   (both only adjust TP, which is unused here).
 - Only the last **closed** 15m candle is evaluated — the still-forming bucket
