@@ -28,7 +28,7 @@ import {
   positionAccountExists,
   QUOTE_MINTS,
 } from "./api/meteora.js";
-import { swapAllToSolFromKey } from "./api/jupiter.js";
+import { swapAllToSolFromKey, getTokenBalanceFromKey } from "./api/jupiter.js";
 import { fetchMarketCap } from "./api/dexscreener.js";
 import { fetchOhlcv } from "./api/geckoterminal.js";
 import { evaluateIndicatorExit, summarizeIndicators } from "./indicatorExit.js";
@@ -572,9 +572,9 @@ async function checkRunnerAlert(entry, poolData) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function swapAttempt({ rpcUrl, privateKeyBase58, poolAddress, baseMint }) {
+async function swapAttempt({ rpcUrl, privateKeyBase58, poolAddress, baseMint, baselineRaw }) {
   try {
-    const result = await swapAllToSolFromKey({ rpcUrl, privateKeyBase58, inputMint: baseMint, slippageBps: 100 });
+    const result = await swapAllToSolFromKey({ rpcUrl, privateKeyBase58, inputMint: baseMint, slippageBps: 100, baselineRaw });
     log("manager", `Jupiter swap done: ${result.sig.slice(0, 20)} — ${(Number(result.outputAmount) / 1e9).toFixed(4)} SOL`);
     return result;
   } catch (jupiterErr) {
@@ -584,7 +584,7 @@ async function swapAttempt({ rpcUrl, privateKeyBase58, poolAddress, baseMint }) 
     }
     log("manager_warn", `Jupiter swap failed (${jupiterErr.message}) — falling back to Meteora`);
     try {
-      const result = await swapTokenToSolViaMeteora(rpcUrl, privateKeyBase58, poolAddress, baseMint);
+      const result = await swapTokenToSolViaMeteora(rpcUrl, privateKeyBase58, poolAddress, baseMint, baselineRaw);
       log("manager", `Meteora swap done: ${result.sig.slice(0, 20)} — ${(Number(result.outputAmount) / 1e9).toFixed(4)} SOL`);
       return result;
     } catch (meteoraErr) {
@@ -629,6 +629,24 @@ async function executeClose(entry, snap, closeReason, positions) {
   await bot.sendHTML(
     `⏳ <b>Auto-Close</b>\n<b>${esc(entry.symbol)}</b> (<code>${esc(positionAddress.slice(0, 8))}…</code>) — ${esc(closeReason)}\nWithdrawing…`,
   );
+
+  // Snapshot the token balance *before* withdrawing. The post-withdraw swap
+  // waits for the balance to rise above this — otherwise leftover dust in the
+  // ATA (or a lagging RPC read) looks like the withdrawn tokens and only the
+  // dust gets sold, stranding the position's real balance in the wallet.
+  let baselineRaw = "0";
+  try {
+    baselineRaw = await getTokenBalanceFromKey({
+      rpcUrl: process.env.HELIUS_RPC_URL,
+      ownerAddress: process.env.WALLET_ADDRESS,
+      mint: entry.baseMint,
+    });
+    if (baselineRaw !== "0") {
+      log("manager", `${entry.symbol}: pre-withdraw ${entry.baseMint.slice(0, 8)} balance ${baselineRaw} (swap will wait past this)`);
+    }
+  } catch (e) {
+    log("manager_warn", `Pre-withdraw balance read failed (${e.message}) — swap falls back to first nonzero balance`);
+  }
 
   const sigs = [];
   let realFailure = false;
@@ -675,6 +693,7 @@ async function executeClose(entry, snap, closeReason, positions) {
       privateKeyBase58: pk,
       poolAddress: entry.poolAddress,
       baseMint: entry.baseMint,
+      baselineRaw,
     });
     if (swapResult) {
       swapSig = swapResult.sig;

@@ -51,16 +51,34 @@ async function apiPost(path, body) {
 }
 
 /**
- * Query the token account balance for a given mint + owner via RPC.
- * Returns the raw u64 amount (string) or null if no account found.
+ * Query the token balance for a given mint + owner via RPC.
+ *
+ * Sums every token account the owner holds for the mint (a wallet can end up
+ * with more than one ATA for the same mint — e.g. an extra account created by
+ * a router — and reading only value[0] would silently under-count).
+ * Returns the raw u64 total as a string ("0" when no accounts exist).
  */
-async function getTokenBalance(conn, ownerPubkey, mintPubkey) {
+export async function getTokenBalance(conn, ownerPubkey, mintPubkey) {
   const { PublicKey } = require("@solana/web3.js");
   const accounts = await conn.getParsedTokenAccountsByOwner(ownerPubkey, {
     mint: new PublicKey(mintPubkey),
   });
-  const amt = accounts?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.amount;
-  return amt ?? null;
+  let total = 0n;
+  for (const acc of accounts?.value ?? []) {
+    const amt = acc?.account?.data?.parsed?.info?.tokenAmount?.amount;
+    if (amt) total += BigInt(amt);
+  }
+  return total.toString();
+}
+
+/**
+ * Read a wallet's raw token balance from credentials alone.
+ * Used by the manager to snapshot the pre-withdraw balance (see `baselineRaw`).
+ */
+export async function getTokenBalanceFromKey({ rpcUrl, ownerAddress, mint }) {
+  const { Connection, PublicKey } = require("@solana/web3.js");
+  const conn = new Connection(rpcUrl, "confirmed");
+  return getTokenBalance(conn, new PublicKey(ownerAddress), mint);
 }
 
 /**
@@ -72,24 +90,86 @@ async function getTokenBalance(conn, ownerPubkey, mintPubkey) {
  * @param {string} opts.inputMint      — SPL token mint to swap from
  * @param {string} [opts.outputMint]   — default: SOL
  * @param {number} [opts.slippageBps]  — default: 100 (1%)
+ * @param {string} [opts.baselineRaw]  — raw balance observed *before* the withdraw
  * @returns {Promise<{ sig: string, inputAmount: string, outputAmount: string }>}
  */
-export async function swapAllToSol({ conn, keypair, inputMint, outputMint = SOL_MINT, slippageBps = 100 }) {
-  const { VersionedTransaction } = require("@solana/web3.js");
-
-  // RPC may lag behind the confirmed withdraw tx — retry up to 10×, 4s apart
-  // (40s total). A 5×3s=15s window proved too short under load: the withdrawn
-  // tokens silently stranded in the wallet (manager logged "no swap needed"
-  // and dropped the position from state, leaving real $ unswapped).
-  let rawAmount = null;
-  for (let attempt = 1; attempt <= 10; attempt++) {
-    rawAmount = await getTokenBalance(conn, keypair.publicKey, inputMint);
-    if (rawAmount && rawAmount !== "0") break;
-    if (attempt < 10) await new Promise((r) => setTimeout(r, 4000));
-  }
-  if (!rawAmount || rawAmount === "0") {
+export async function swapAllToSol({ conn, keypair, inputMint, outputMint = SOL_MINT, slippageBps = 100, baselineRaw = "0" }) {
+  const rawAmount = await waitForWithdrawnBalance({ conn, keypair, inputMint, baselineRaw });
+  if (rawAmount === 0n) {
     throw new Error(`No ${inputMint.slice(0, 8)}… balance to swap`);
   }
+
+  // Swap in rounds, sweeping whatever is left after each one. A single round
+  // can leave tokens behind when the balance grew between the read and the
+  // swap (a second withdraw tx landing, RPC lag), and stranded tokens are real
+  // money — so re-read and swap again while a meaningful remainder is left.
+  const MAX_ROUNDS = 3;
+  let amount = rawAmount;
+  let totalIn = 0n, totalOut = 0n, lastSig = null;
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    const result = await swapExactAmount({ conn, keypair, inputMint, outputMint, slippageBps, rawAmount: amount.toString() });
+    totalIn  += amount;
+    totalOut += BigInt(result.outputAmount ?? 0);
+    lastSig   = result.sig;
+    if (round === MAX_ROUNDS) break;
+
+    const remaining = await settleBalanceAfterSwap({ conn, keypair, inputMint, before: amount });
+    // Ignore trailing dust (<1% of what we just sold) — not worth another fee.
+    if (remaining === 0n || remaining * 100n < amount) break;
+    console.warn(`[jupiter] ${remaining} ${inputMint.slice(0, 8)}… left after swap — sweeping (round ${round + 1})`);
+    amount = remaining;
+  }
+
+  return { sig: lastSig, inputAmount: totalIn.toString(), outputAmount: totalOut.toString() };
+}
+
+/**
+ * Wait for the post-withdraw token balance to show up.
+ *
+ * Polls up to 10× / 4s apart (40s). The balance must exceed `baselineRaw` —
+ * what the wallet already held before the withdraw — otherwise a stale RPC
+ * read of leftover dust satisfies the poll instantly and only the dust gets
+ * swapped while the withdrawn tokens sit stranded in the wallet (this happened:
+ * a 146k-token position sold 0.02 tokens for 846 lamports).
+ *
+ * If the poll expires with the balance still at/below baseline, whatever is
+ * actually there is returned anyway — sweeping stale dust beats sweeping
+ * nothing, and an all-SOL position simply reads 0 and is reported as such.
+ */
+async function waitForWithdrawnBalance({ conn, keypair, inputMint, baselineRaw = "0" }) {
+  const baseline = BigInt(baselineRaw || "0");
+  let current = 0n;
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    current = BigInt(await getTokenBalance(conn, keypair.publicKey, inputMint));
+    if (current > baseline) return current;
+    if (attempt < 10) await new Promise((r) => setTimeout(r, 4000));
+  }
+  if (current > 0n) {
+    console.warn(`[jupiter] balance for ${inputMint.slice(0, 8)}… never rose above the pre-withdraw ${baseline} — swapping the ${current} present`);
+  }
+  return current;
+}
+
+/**
+ * After a confirmed swap, wait briefly for the RPC to reflect the spend, then
+ * report what is left. Without the wait the pre-swap balance reads back
+ * unchanged and the sweep would re-sell tokens that are already gone.
+ */
+async function settleBalanceAfterSwap({ conn, keypair, inputMint, before }) {
+  let remaining = before;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    remaining = BigInt(await getTokenBalance(conn, keypair.publicKey, inputMint));
+    if (remaining < before) break;
+  }
+  return remaining < before ? remaining : 0n;
+}
+
+/**
+ * Swap an exact raw amount of `inputMint` to `outputMint`, with retries.
+ */
+async function swapExactAmount({ conn, keypair, inputMint, outputMint, slippageBps, rawAmount }) {
+  const { VersionedTransaction } = require("@solana/web3.js");
 
   // Build + send + confirm as a retried unit. Each attempt fetches a FRESH
   // Jupiter swap tx (with a new embedded blockhash), so two previously-common
@@ -148,7 +228,7 @@ export async function swapAllToSol({ conn, keypair, inputMint, outputMint = SOL_
         return {
           sig,
           inputAmount:  rawAmount,
-          outputAmount: quote?.outAmount ?? "?",
+          outputAmount: quote?.outAmount ?? "0",
         };
       } catch (e) {
         lastErr = e;
@@ -170,13 +250,14 @@ export async function swapAllToSol({ conn, keypair, inputMint, outputMint = SOL_
  * @param {string} opts.inputMint        — SPL token mint to swap from
  * @param {string} [opts.outputMint]     — default: SOL
  * @param {number} [opts.slippageBps]    — default: 100 (1%)
+ * @param {string} [opts.baselineRaw]    — raw balance observed before the withdraw
  */
-export async function swapAllToSolFromKey({ rpcUrl, privateKeyBase58, inputMint, outputMint = SOL_MINT, slippageBps = 100 }) {
+export async function swapAllToSolFromKey({ rpcUrl, privateKeyBase58, inputMint, outputMint = SOL_MINT, slippageBps = 100, baselineRaw = "0" }) {
   const { Connection, Keypair } = require("@solana/web3.js");
   const secretKey = bs58.default?.decode
     ? bs58.default.decode(privateKeyBase58)
     : bs58.decode(privateKeyBase58);
   const keypair = Keypair.fromSecretKey(secretKey);
   const conn    = new Connection(rpcUrl, "confirmed");
-  return swapAllToSol({ conn, keypair, inputMint, outputMint, slippageBps });
+  return swapAllToSol({ conn, keypair, inputMint, outputMint, slippageBps, baselineRaw });
 }

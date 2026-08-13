@@ -13,6 +13,7 @@
 
 import { createRequire } from "module";
 import { config } from "../config.js";
+import { getTokenBalance } from "./jupiter.js";
 
 const HOST = process.env.METEORA_DLMM_HOST ?? "https://dlmm.datapi.meteora.ag";
 
@@ -349,7 +350,7 @@ export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, po
  *
  * Returns { sig, inputAmount, outputAmount } — outputAmount is in lamports.
  */
-export async function swapTokenToSolViaMeteora(rpcUrl, privateKeyBase58, poolAddress, inputMint) {
+export async function swapTokenToSolViaMeteora(rpcUrl, privateKeyBase58, poolAddress, inputMint, baselineRaw = "0") {
   const DLMM = require("@meteora-ag/dlmm");
   const { Connection, PublicKey, Keypair, sendAndConfirmTransaction } = require("@solana/web3.js");
 
@@ -361,11 +362,14 @@ export async function swapTokenToSolViaMeteora(rpcUrl, privateKeyBase58, poolAdd
   const inputPubkey = new PublicKey(inputMint);
 
   // Retry balance check — RPC may lag behind a freshly confirmed withdraw tx.
-  let rawAmount = null;
+  // The balance must exceed `baselineRaw` (what the wallet held *before* the
+  // withdraw), or leftover dust read from a lagging RPC ends the poll early and
+  // only the dust gets swapped — see waitForWithdrawnBalance in api/jupiter.js.
+  const baseline = BigInt(baselineRaw || "0");
+  let rawAmount = "0";
   for (let attempt = 1; attempt <= 5; attempt++) {
-    const accounts = await conn.getParsedTokenAccountsByOwner(keypair.publicKey, { mint: inputPubkey });
-    rawAmount = accounts?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.amount ?? null;
-    if (rawAmount && rawAmount !== "0") break;
+    rawAmount = await getTokenBalance(conn, keypair.publicKey, inputMint);
+    if (BigInt(rawAmount) > baseline) break;
     if (attempt < 5) await new Promise((r) => setTimeout(r, 3000));
   }
   if (!rawAmount || rawAmount === "0") {
