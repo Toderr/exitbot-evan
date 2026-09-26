@@ -343,6 +343,141 @@ export async function withdrawPosition(rpcUrl, privateKeyBase58, poolAddress, po
 }
 
 /**
+ * Rebalance a managed position to the pool's current price — quote-side
+ * (SOL) only. Withdraws 100% of the existing position's liquidity + fees,
+ * then redeposits *only the quote side* into a range that sits strictly
+ * below the current active bin (never including it), sized to `rangeBins`
+ * and shaped by `strategy`. Any base-token amount claimed on withdraw (fees
+ * or leftover) is never redeposited — it's simply left in the wallet, since
+ * a range that starts below the active bin can never require the base
+ * token side. Built on the DLMM SDK's native rebalance instruction
+ * (`simulateRebalancePosition` + `rebalancePosition`) — one on-chain
+ * instruction, same position address, no new position account created.
+ *
+ * @param {string} rpcUrl
+ * @param {string} privateKeyBase58
+ * @param {string} poolAddress
+ * @param {{ publicKey: string }} position
+ * @param {{ strategy: "Spot"|"Curve"|"BidAsk", rangeBins: number, depositLamports?: string|null, maxActiveBinSlippage?: number }} opts
+ *   depositLamports null/undefined = redeposit everything withdrawn (quote side + quote fees).
+ * @returns {Promise<{ sigs: string[], lowerBinId: number, upperBinId: number, depositedLamports: string }>}
+ */
+export async function rebalancePositionOneSidedQuote(rpcUrl, privateKeyBase58, poolAddress, position, opts = {}) {
+  const DLMM = require("@meteora-ag/dlmm");
+  const { Connection, PublicKey, Keypair, ComputeBudgetProgram, Transaction, sendAndConfirmTransaction } = require("@solana/web3.js");
+
+  const strategy = opts.strategy ?? "Spot";
+  const rangeBins = Number(opts.rangeBins);
+  const maxActiveBinSlippage = opts.maxActiveBinSlippage ?? 3;
+  if (!Number.isInteger(rangeBins) || rangeBins <= 0) {
+    throw new Error("rangeBins must be a positive integer");
+  }
+
+  const secretKey = bs58.default?.decode
+    ? bs58.default.decode(privateKeyBase58)
+    : bs58.decode(privateKeyBase58);
+  const keypair = Keypair.fromSecretKey(secretKey);
+  const conn    = new Connection(rpcUrl, "confirmed");
+
+  const positionPubkey = new PublicKey(position.publicKey);
+  const poolPubkey     = new PublicKey(poolAddress);
+
+  const positionAccount = await withTimeout(conn.getAccountInfo(positionPubkey), 15_000, "getAccountInfo");
+  if (!positionAccount) {
+    throw new Error(`Position ${position.publicKey.slice(0, 8)} not found on-chain — already closed or datapi stale`);
+  }
+
+  const lbPair = await withTimeout(DLMM.create(conn, poolPubkey), 20_000, "DLMM.create");
+  const onChainPos = await withTimeout(lbPair.getPosition(positionPubkey), 20_000, "getPosition");
+  const { positionData } = onChainPos;
+
+  const activeBin = await withTimeout(lbPair.getActiveBin(), 15_000, "getActiveBin");
+  const activeId = new BN(activeBin.binId);
+  const binStep = new BN(lbPair.lbPair.binStep);
+  const strategyType = DLMM.StrategyType?.[strategy] ?? DLMM.StrategyType.Spot;
+
+  // Withdraw the entire existing range.
+  const withdrawParam = {
+    minBinId: new BN(positionData.lowerBinId),
+    maxBinId: new BN(positionData.upperBinId),
+    bps: new BN(10000),
+  };
+
+  // Quote side only — X (base) amount is always 0. Range is strictly below
+  // the active bin (maxDeltaId = -1), so the active bin itself, which needs
+  // both sides, is never part of the new range. This is what forces the
+  // rebalance to be single-sided on the quote token, always.
+  const totalWithdrawnY = new BN(positionData.totalYAmount).add(new BN(positionData.feeY));
+  const depositAmountY = opts.depositLamports != null ? new BN(opts.depositLamports) : totalWithdrawnY;
+  if (depositAmountY.lten(0)) {
+    throw new Error("Deposit amount must be greater than zero.");
+  }
+
+  const minDeltaId = new BN(-rangeBins);
+  const maxDeltaId = new BN(-1);
+
+  const strategyParams = DLMM.buildLiquidityStrategyParameters(
+    new BN(0), depositAmountY, minDeltaId, maxDeltaId, binStep, false, activeId,
+    DLMM.getLiquidityStrategyParameterBuilder(strategyType),
+  );
+
+  const depositParam = {
+    minDeltaId, maxDeltaId,
+    x0: strategyParams.x0, y0: strategyParams.y0,
+    deltaX: strategyParams.deltaX, deltaY: strategyParams.deltaY,
+    favorXInActiveBin: false,
+  };
+
+  const rebalanceResponse = await withTimeout(
+    lbPair.simulateRebalancePosition(positionPubkey, positionData, true, true, [depositParam], [withdrawParam]),
+    20_000,
+    "simulateRebalancePosition",
+  );
+
+  const { initBinArrayInstructions, rebalancePositionInstruction } = await withTimeout(
+    lbPair.rebalancePosition(rebalanceResponse, new BN(maxActiveBinSlippage), keypair.publicKey, 100),
+    20_000,
+    "rebalancePosition",
+  );
+
+  const priorityFee = await getPriorityFeeMicroLamports(
+    rpcUrl,
+    [poolPubkey.toBase58(), positionPubkey.toBase58()],
+    config.withdrawPriorityFee,
+  );
+  const priorityIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee });
+
+  const sigs = [];
+  // New bin arrays the below-active range needs (if not already
+  // initialized) must land on-chain before the rebalance instruction
+  // itself, so they're sent as their own transaction first.
+  if (initBinArrayInstructions.length > 0) {
+    const tx = new Transaction().add(priorityIx, ...initBinArrayInstructions);
+    const sig = await withTimeout(
+      sendAndConfirmTransaction(conn, tx, [keypair], { commitment: "confirmed", skipPreflight: true }),
+      45_000,
+      "sendAndConfirmTransaction(initBinArrays)",
+    );
+    sigs.push(sig);
+  }
+
+  const rebalanceTx = new Transaction().add(priorityIx, ...rebalancePositionInstruction);
+  const rebalanceSig = await withTimeout(
+    sendAndConfirmTransaction(conn, rebalanceTx, [keypair], { commitment: "confirmed", skipPreflight: true }),
+    45_000,
+    "sendAndConfirmTransaction(rebalance)",
+  );
+  sigs.push(rebalanceSig);
+
+  return {
+    sigs,
+    lowerBinId: activeId.toNumber() + minDeltaId.toNumber(),
+    upperBinId: activeId.toNumber() + maxDeltaId.toNumber(),
+    depositedLamports: depositAmountY.toString(),
+  };
+}
+
+/**
  * Swap a token back to SOL using the Meteora DLMM pool it came from.
  *
  * Queries the wallet's token balance (with retry to handle RPC lag after a

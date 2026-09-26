@@ -80,6 +80,22 @@ export const config = {
     keepOorClose: true,     // OOR still closes an indicator-exit position
   },
 
+  // Manual /rebalance — recenters a managed position's liquidity to the
+  // pool's current price. Uses the DLMM SDK's native rebalance instruction
+  // (withdraw 100% + redeposit in one on-chain instruction, same position
+  // address) — the same primitive other DLMM bots expose as a single
+  // button. User-triggered only, never run by the 15s cron.
+  //
+  // Always redeposits quote-only (SOL), strictly below the current active
+  // bin — never touching the active bin itself — so the new range can only
+  // ever hold the quote side, never the base token. Any base token claimed
+  // from the old position on withdraw is left in the wallet, not
+  // redeposited. Shape, bin-range width, and deposit amount are asked in
+  // the /rebalance Telegram flow each time, not fixed here.
+  rebalance: {
+    maxActiveBinSlippage: 3, // bins of active-bin drift allowed between simulate and execute
+  },
+
   // Give up auto-closing a position after this many consecutive withdraw
   // failures — surfaced to Telegram, must be closed manually after that.
   maxCloseFailures: 4,
@@ -107,4 +123,5 @@ export const config = {
   journalFile: "./state/journal.jsonl",
   pendingScanFile: "./state/pending-scan.json",
   awaitingCustomFile: "./state/awaiting-custom.json",
+  awaitingRebalanceFile: "./state/awaiting-rebalance.json",
 };

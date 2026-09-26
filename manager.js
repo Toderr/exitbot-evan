@@ -26,6 +26,7 @@ import {
   withdrawPosition,
   swapTokenToSolViaMeteora,
   positionAccountExists,
+  rebalancePositionOneSidedQuote,
   QUOTE_MINTS,
 } from "./api/meteora.js";
 import { swapAllToSolFromKey, getTokenBalanceFromKey } from "./api/jupiter.js";
@@ -353,6 +354,87 @@ export function forget(positionAddress) {
   delete positions[positionAddress];
   savePositions(positions);
   return true;
+}
+
+// ─── /rebalance — recenter a managed position's liquidity to current price ──
+// User-triggered only (never run by the 15s cron). Withdraws 100% of the
+// position's liquidity + fees and redeposits — quote (SOL) side only, in a
+// range strictly below the current active bin — see
+// api/meteora.js:rebalancePositionOneSidedQuote. Same position address, so
+// SL/TP config carries over unchanged; only the range/deposit/grace-period
+// fields are refreshed to reflect the new liquidity.
+//
+// `params.shape` ("Spot"|"Curve"|"BidAsk"), `params.rangeBins` (positive
+// int bin width), and `params.depositSol` (SOL amount, or null/undefined to
+// redeposit everything withdrawn) are all asked interactively in the
+// /rebalance Telegram flow — see setAwaitingRebalance below.
+export async function rebalanceEntry(positionAddress, params) {
+  const positions = loadPositions();
+  const entry = positions[positionAddress];
+  if (!entry) return { ok: false, error: "Position is not currently managed." };
+
+  const strategy = params.shape;
+  const rangeBins = params.rangeBins;
+  const maxActiveBinSlippage = config.rebalance?.maxActiveBinSlippage ?? 3;
+  const depositLamports = params.depositSol != null ? String(Math.round(params.depositSol * 1e9)) : null;
+
+  const result = await rebalancePositionOneSidedQuote(
+    process.env.HELIUS_RPC_URL,
+    process.env.SOLANA_PRIVATE_KEY,
+    entry.poolAddress,
+    { publicKey: positionAddress },
+    { strategy, rangeBins, depositLamports, maxActiveBinSlippage },
+  );
+
+  entry.lowerBinId = result.lowerBinId;
+  entry.upperBinId = result.upperBinId;
+  entry.binCount = result.upperBinId - result.lowerBinId + 1;
+  entry.shape = `${strategy} (one-side quote, rebalanced)`;
+  // Fresh grace period — the position's PnL/range are effectively reset by
+  // the withdraw+redeposit, so don't evaluate SL/TP against it immediately.
+  entry.adoptedAt = Math.floor(Date.now() / 1000);
+  entry.highTvlMode = false;
+  entry.runnerMode = false;
+  entry.touchedMinus5 = false;
+  entry.oorBelowAlerted = false;
+  entry.closeFailCount = 0;
+  entry.takeProfitPct = entry.baseTakeProfitPct ?? config.takeProfitPct;
+
+  const { depositSol, depositUsd } = await fetchPositionDeposit(entry.poolAddress, process.env.WALLET_ADDRESS, positionAddress).catch(() => ({ depositSol: null, depositUsd: null }));
+  if (depositSol != null || depositUsd != null) {
+    entry.depositSol = depositSol;
+    entry.depositUsd = depositUsd;
+  }
+
+  positions[positionAddress] = entry;
+  savePositions(positions);
+  slBelowCount.delete(positionAddress);
+  missingCount.delete(positionAddress);
+
+  log("manager", `Rebalanced ${positionAddress.slice(0, 8)} (${entry.symbol}) → bins ${entry.lowerBinId}-${entry.upperBinId}, deposited ${(Number(result.depositedLamports) / 1e9).toFixed(4)} SOL`);
+  return { ok: true, entry, sigs: result.sigs, depositedSol: Number(result.depositedLamports) / 1e9 };
+}
+
+// ─── Awaiting-rebalance-reply state ───────────────────────────────────────
+// Single-slot, same reasoning as awaiting-custom above (one-user DM bot).
+// Walks: shape (button tap, not stored here) → rangeBins (text) →
+// depositSol (text) → confirm (button tap, reads the accumulated data).
+export function setAwaitingRebalance(positionAddress, step, data = {}) {
+  fs.mkdirSync(path.dirname(config.awaitingRebalanceFile), { recursive: true });
+  fs.writeFileSync(config.awaitingRebalanceFile, JSON.stringify({ positionAddress, step, ...data }));
+}
+
+export function getAwaitingRebalance() {
+  if (!fs.existsSync(config.awaitingRebalanceFile)) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(config.awaitingRebalanceFile, "utf8"));
+    if (!data?.positionAddress || !data?.step) return null;
+    return data;
+  } catch { return null; }
+}
+
+export function clearAwaitingRebalance() {
+  try { fs.unlinkSync(config.awaitingRebalanceFile); } catch { /* already gone */ }
 }
 
 // ─── Snapshot (PnL/OOR from Meteora datapi) ──────────────────────────────────

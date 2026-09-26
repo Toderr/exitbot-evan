@@ -20,6 +20,10 @@ import {
   setAwaitingCustom,
   getAwaitingCustom,
   clearAwaitingCustom,
+  rebalanceEntry,
+  setAwaitingRebalance,
+  getAwaitingRebalance,
+  clearAwaitingRebalance,
 } from "./manager.js";
 import { card } from "./richCard.js";
 
@@ -43,6 +47,8 @@ const HELP_TEXT =
   "(15m RSI(2)&gt;90 AND (MACD first green histogram OR close &gt; upper Bollinger) — " +
   "SL is opt-in with your own percent, OOR still applies)\n" +
   "/status — list currently managed positions\n" +
+  "/rebalance — pick a managed position, choose a shape/range/deposit amount, and recenter its liquidity to the current price — " +
+  "quote (SOL) side only, strictly below the active bin\n" +
   "/stop — pick a managed position to stop managing (or stop ALL managed positions)\n" +
   "/forget &lt;positionAddress&gt; — stop managing a position without closing it\n" +
   "/cancel — cancel a pending custom TP/SL prompt\n" +
@@ -86,6 +92,132 @@ function handleStopAll() {
   for (const p of managed) forget(p.positionAddress);
   log("listener", `stopped managing all ${managed.length} position(s) via /stop → Stop ALL`);
   return { ok: true, text: `⛔ Stopped managing all ${managed.length} position(s) (left untouched on-chain).` };
+}
+
+// /rebalance picker: one button per managed position, then a confirm step —
+// this moves real on-chain funds (withdraw + redeposit), so a single button
+// tap from /stop's list isn't enough; require a second explicit tap.
+function buildRebalanceKeyboard(managed) {
+  return {
+    inline_keyboard: managed.map((p) => ([
+      { text: `⚖️ ${p.symbol} (${p.positionAddress.slice(0, 6)}…)`, callback_data: `rebalpick:${p.positionAddress}` },
+    ])),
+  };
+}
+
+async function handleRebalance() {
+  const managed = listManaged();
+  if (managed.length === 0) {
+    await bot.sendMessage("Nothing is currently managed.");
+    return;
+  }
+  const lines = [
+    "Which position should I recenter to the current price?",
+    "",
+    ...managed.map((p) => `• <b>${esc(p.symbol)}</b> (<code>${esc(p.positionAddress.slice(0, 8))}…</code>) — bins ${p.lowerBinId}–${p.upperBinId}`),
+  ];
+  await bot.sendHTML(lines.join("\n"), { replyMarkup: buildRebalanceKeyboard(managed) });
+}
+
+// Step 2: shape choice for the recentered (quote-only) range.
+function buildRebalanceShapeKeyboard(positionAddress) {
+  return {
+    inline_keyboard: [
+      [{ text: "◼️ Spot", callback_data: `rebalshape:${positionAddress}:Spot` }],
+      [{ text: "⛰️ Curve", callback_data: `rebalshape:${positionAddress}:Curve` }],
+      [{ text: "🦅 Bid-Ask", callback_data: `rebalshape:${positionAddress}:BidAsk` }],
+    ],
+  };
+}
+
+async function handleRebalancePick(positionAddress, chatId, messageId) {
+  const entry = listManaged().find((p) => p.positionAddress === positionAddress);
+  if (!entry) return { text: "That position is no longer managed." };
+  clearAwaitingRebalance();
+  await bot.editMessageText(
+    chatId, messageId,
+    `<b>${esc(entry.symbol)}</b> (<code>${esc(positionAddress.slice(0, 8))}…</code>) — current bins ${entry.lowerBinId}–${entry.upperBinId}.\n` +
+    `This withdraws 100% of the position (+ fees) and redeposits <b>quote (SOL) side only</b>, strictly below the current price (never touching the active bin) — pick the deposit shape:`,
+    { replyMarkup: buildRebalanceShapeKeyboard(positionAddress) },
+  );
+  return { text: "Pick a shape." };
+}
+
+async function handleRebalanceShapePick(positionAddress, shape, chatId, messageId) {
+  const entry = listManaged().find((p) => p.positionAddress === positionAddress);
+  if (!entry) return { text: "That position is no longer managed." };
+  setAwaitingRebalance(positionAddress, "range", { shape });
+  await bot.editMessageText(
+    chatId, messageId,
+    `<b>${esc(entry.symbol)}</b> — shape: <b>${esc(shape)}</b>.\n` +
+    `Send the bin range width (how many bins below the current price), e.g. <code>20</code>. Send /cancel to abort.`,
+  );
+  return { text: "Waiting for range width…" };
+}
+
+async function handleRebalanceRangeReply(awaiting, text) {
+  const rangeBins = Number(text.trim());
+  if (!Number.isInteger(rangeBins) || rangeBins <= 0) {
+    return { ok: false, text: "Couldn't parse that. Send a positive whole number of bins, e.g. 20, or /cancel." };
+  }
+  setAwaitingRebalance(awaiting.positionAddress, "deposit", { shape: awaiting.shape, rangeBins });
+  return {
+    ok: true,
+    text: `Range: <b>${rangeBins}</b> bins below current price.\n` +
+      `Send the SOL amount to deposit (e.g. <code>0.5</code>), or <code>max</code> to redeposit everything withdrawn from this position. /cancel to abort.`,
+  };
+}
+
+const MAX_DEPOSIT_ALIASES = new Set(["max", "maks", "semua", "all"]);
+
+async function handleRebalanceDepositReply(awaiting, text) {
+  const raw = text.trim().toLowerCase();
+  let depositSol = null;
+  if (!MAX_DEPOSIT_ALIASES.has(raw)) {
+    depositSol = Number(raw);
+    if (!Number.isFinite(depositSol) || depositSol <= 0) {
+      return { ok: false, text: "Couldn't parse that. Send a positive SOL amount (e.g. 0.5), `max`, or /cancel." };
+    }
+  }
+  setAwaitingRebalance(awaiting.positionAddress, "confirm", { shape: awaiting.shape, rangeBins: awaiting.rangeBins, depositSol });
+  const entry = listManaged().find((p) => p.positionAddress === awaiting.positionAddress);
+  const depositLabel = depositSol != null ? `${depositSol} SOL` : "everything withdrawn (max)";
+  return {
+    ok: true,
+    text: `<b>${esc(entry?.symbol ?? awaiting.positionAddress.slice(0, 8))}</b> — confirm rebalance:\n` +
+      `Shape: <b>${esc(awaiting.shape)}</b> · Range: <b>${awaiting.rangeBins}</b> bins below price · Deposit: <b>${esc(depositLabel)}</b>`,
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: "✅ Confirm rebalance", callback_data: `rebalconfirm:${awaiting.positionAddress}` }],
+        [{ text: "❌ Cancel", callback_data: "rebalcancel" }],
+      ],
+    },
+  };
+}
+
+async function handleRebalanceConfirm(positionAddress, chatId, messageId) {
+  const awaiting = getAwaitingRebalance();
+  if (!awaiting || awaiting.positionAddress !== positionAddress || awaiting.step !== "confirm") {
+    return { ok: false, text: "This rebalance prompt has expired — send /rebalance again." };
+  }
+  clearAwaitingRebalance();
+  await bot.editMessageText(chatId, messageId, `⏳ Rebalancing <code>${esc(positionAddress.slice(0, 8))}…</code>…`);
+  const result = await rebalanceEntry(positionAddress, {
+    shape: awaiting.shape,
+    rangeBins: awaiting.rangeBins,
+    depositSol: awaiting.depositSol,
+  });
+  if (!result.ok) {
+    return { ok: false, text: `❌ Rebalance failed: ${esc(result.error)}` };
+  }
+  const { entry, sigs, depositedSol } = result;
+  return {
+    ok: true,
+    text: `⚖️ <b>Rebalanced</b> — <b>${esc(entry.symbol)}</b> (<code>${esc(positionAddress.slice(0, 8))}…</code>)\n` +
+      `New bins: ${entry.lowerBinId}–${entry.upperBinId} (quote-only)\n` +
+      `Deposited: <b>${depositedSol.toFixed(4)} SOL</b>\n` +
+      sigs.map((s) => `<code>${esc(s.slice(0, 20))}…</code>`).join("\n"),
+  };
 }
 
 // Step 1 of adoption: one "pick" button per candidate (numbered to match the
@@ -239,16 +371,17 @@ async function handleIndicatorSlPrompt(positionAddress, chatId, messageId) {
   setAwaitingCustom(positionAddress, "indicatorSl");
   await bot.editMessageText(
     chatId, messageId,
-    `<b>${esc(candidate.symbol)}</b> — send your Stop Loss percent, e.g. <code>6</code> ` +
-    `for -6% PnL. Send /cancel to abort.`,
+    `<b>${esc(candidate.symbol)}</b> — kirim angka SL kamu (isi <b>positif</b>, jangan pakai minus).\n` +
+    `Contoh: <code>6</code> → SL -6% PnL.\n` +
+    `Kirim /cancel untuk membatalkan.`,
   );
   return { text: "Waiting for your SL number…" };
 }
 
 async function handleIndicatorSlReply(positionAddress, text) {
   const raw = Number(text.trim());
-  if (!Number.isFinite(raw)) return { ok: false, text: "Couldn't parse that. Send a number like 6, or /cancel." };
-  if (raw === 0) return { ok: false, text: "SL must be non-zero (e.g. 6 for -6%)." };
+  if (!Number.isFinite(raw)) return { ok: false, text: "Nggak kebaca. Kirim angka positif, contoh 6, atau /cancel." };
+  if (raw === 0) return { ok: false, text: "SL harus lebih dari 0 (contoh: 6 untuk -6%)." };
   const sl = -Math.abs(raw);
 
   const entry = await adoptCandidate(positionAddress, { exitMode: "indicator", indicatorSlEnabled: true, stopLossPct: sl });
@@ -297,10 +430,10 @@ async function handleCustomTpSlReply(positionAddress, text) {
   const tp = Number(parts[0]);
   const slRaw = Number(parts[1]);
   if (parts.length < 2 || parts.length > 3 || !Number.isFinite(tp) || !Number.isFinite(slRaw)) {
-    return { ok: false, text: "Couldn't parse that. Send `TP SL [mode]` like `0.8 6` or `0.8 6 both`, or /cancel." };
+    return { ok: false, text: "Nggak kebaca. Kirim `TP SL [mode]` contoh `0.8 6` atau `0.8 6 both` (keduanya positif), atau /cancel." };
   }
-  if (tp <= 0) return { ok: false, text: "TP must be a positive number (e.g. 0.8 for +0.8%)." };
-  if (slRaw === 0) return { ok: false, text: "SL must be non-zero (e.g. 6 for -6%)." };
+  if (tp <= 0) return { ok: false, text: "TP harus angka positif (contoh 0.8 untuk +0.8%)." };
+  if (slRaw <= 0) return { ok: false, text: "SL harus angka positif, jangan pakai minus (contoh 6 untuk -6%)." };
   const sl = -Math.abs(slRaw);
 
   let slMode = "pnl";
@@ -367,6 +500,31 @@ export function startListener() {
               } else if (data.startsWith("customtp:")) {
                 result = await handleCustomTpPrompt(data.slice("customtp:".length), chat, msgId);
                 await bot.answerCallbackQuery(cq.id, { text: result.text });
+              } else if (data.startsWith("rebalpick:")) {
+                result = await handleRebalancePick(data.slice("rebalpick:".length), chat, msgId);
+                await bot.answerCallbackQuery(cq.id, { text: result.text });
+              } else if (data.startsWith("rebalshape:")) {
+                const rest = data.slice("rebalshape:".length);
+                const sep = rest.lastIndexOf(":");
+                result = await handleRebalanceShapePick(rest.slice(0, sep), rest.slice(sep + 1), chat, msgId);
+                await bot.answerCallbackQuery(cq.id, { text: result.text });
+              } else if (data.startsWith("rebalconfirm:")) {
+                // Answer the tap immediately — the rebalance itself (two
+                // on-chain txs) can easily run past Telegram's callback-query
+                // answer window, so the final result is delivered via
+                // editMessageText instead, which has no such deadline.
+                await bot.answerCallbackQuery(cq.id, { text: "Rebalancing…" });
+                try {
+                  result = await handleRebalanceConfirm(data.slice("rebalconfirm:".length), chat, msgId);
+                  await bot.editMessageText(chat, msgId, result.text);
+                } catch (e) {
+                  log("listener_error", `rebalance failed: ${e.message}`);
+                  await bot.editMessageText(chat, msgId, `❌ Rebalance failed: ${esc(e.message)}`);
+                }
+              } else if (data === "rebalcancel") {
+                clearAwaitingRebalance();
+                await bot.answerCallbackQuery(cq.id, { text: "Cancelled." });
+                await bot.editMessageText(chat, msgId, "Rebalance cancelled.");
               } else if (data.startsWith("stopone:")) {
                 result = handleStopOne(data.slice("stopone:".length));
                 await bot.answerCallbackQuery(cq.id, { text: result.text });
@@ -392,6 +550,23 @@ export function startListener() {
 
           const text = msg.text.trim();
 
+          // A /rebalance range or deposit prompt takes priority over command
+          // parsing, except /cancel and /rebalance (starting over should
+          // always be possible).
+          const awaitingRebal = getAwaitingRebalance();
+          if (awaitingRebal && text !== "/cancel" && !text.startsWith("/rebalance") && (awaitingRebal.step === "range" || awaitingRebal.step === "deposit")) {
+            try {
+              const result = awaitingRebal.step === "range"
+                ? await handleRebalanceRangeReply(awaitingRebal, text)
+                : await handleRebalanceDepositReply(awaitingRebal, text);
+              await bot.sendHTML(result.text, { replyMarkup: result.replyMarkup });
+            } catch (e) {
+              log("listener_error", `rebalance reply handling failed: ${e.message}`);
+              await bot.sendMessage(`❌ Error: ${e.message}`);
+            }
+            continue;
+          }
+
           // A custom-TP/SL or indicator-SL prompt takes priority over command
           // parsing, except /cancel and /scan (starting over should always be
           // possible).
@@ -413,6 +588,7 @@ export function startListener() {
 
           if (cmd === "/scan") {
             clearAwaitingCustom();
+            clearAwaitingRebalance();
             try {
               await handleScan();
             } catch (e) {
@@ -421,6 +597,14 @@ export function startListener() {
             }
           } else if (cmd === "/status") {
             await bot.sendRichHTML(await statusText());
+          } else if (cmd === "/rebalance") {
+            clearAwaitingRebalance();
+            try {
+              await handleRebalance();
+            } catch (e) {
+              log("listener_error", `/rebalance failed: ${e.message}`);
+              await bot.sendMessage(`❌ Error: ${e.message}`);
+            }
           } else if (cmd === "/stop") {
             try {
               await handleStop();
@@ -440,6 +624,9 @@ export function startListener() {
             if (awaiting) {
               clearAwaitingCustom();
               await bot.sendMessage("Cancelled. Send /scan to try again.");
+            } else if (awaitingRebal) {
+              clearAwaitingRebalance();
+              await bot.sendMessage("Rebalance cancelled. Send /rebalance to try again.");
             } else {
               await bot.sendMessage("Nothing to cancel.");
             }
