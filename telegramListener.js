@@ -239,16 +239,17 @@ async function handleIndicatorSlPrompt(positionAddress, chatId, messageId) {
   setAwaitingCustom(positionAddress, "indicatorSl");
   await bot.editMessageText(
     chatId, messageId,
-    `<b>${esc(candidate.symbol)}</b> — send your Stop Loss as a negative number, e.g. <code>-6</code> ` +
+    `<b>${esc(candidate.symbol)}</b> — send your Stop Loss percent, e.g. <code>6</code> ` +
     `for -6% PnL. Send /cancel to abort.`,
   );
   return { text: "Waiting for your SL number…" };
 }
 
 async function handleIndicatorSlReply(positionAddress, text) {
-  const sl = Number(text.trim());
-  if (!Number.isFinite(sl)) return { ok: false, text: "Couldn't parse that. Send a negative number like -6, or /cancel." };
-  if (sl >= 0) return { ok: false, text: "SL must be a negative number (e.g. -6 for -6%)." };
+  const raw = Number(text.trim());
+  if (!Number.isFinite(raw)) return { ok: false, text: "Couldn't parse that. Send a number like 6, or /cancel." };
+  if (raw === 0) return { ok: false, text: "SL must be non-zero (e.g. 6 for -6%)." };
+  const sl = -Math.abs(raw);
 
   const entry = await adoptCandidate(positionAddress, { exitMode: "indicator", indicatorSlEnabled: true, stopLossPct: sl });
   clearAwaitingCustom();
@@ -264,13 +265,13 @@ async function handleCustomTpPrompt(positionAddress, chatId, messageId) {
     chatId, messageId,
     `<b>${esc(candidate.symbol)}</b> — atur TP dan SL kamu\n\n` +
     `Format: <code>TP SL [mode]</code>\n` +
-    `Contoh: <code>0.8 -6</code> → TP +0.8%, SL -6%\n` +
-    `(TP harus positif, SL harus negatif)\n\n` +
+    `Contoh: <code>0.8 6</code> → TP +0.8%, SL -6%\n` +
+    `(TP dan SL sama-sama diisi angka positif)\n\n` +
     `Kata ke-3 opsional — mode SL:\n` +
     `• <code>pnl</code> — SL berdasarkan PnL% saja (default)\n` +
     `• <code>oorbelow</code> — SL langsung aktif begitu harga keluar dari range\n` +
     `• <code>both</code> — mana yang lebih dulu tercapai\n` +
-    `Contoh: <code>0.8 -6 both</code>\n\n` +
+    `Contoh: <code>0.8 6 both</code>\n\n` +
     `Kirim /cancel untuk membatalkan.`,
   );
   return { text: "Waiting for your TP/SL numbers…" };
@@ -294,12 +295,13 @@ const SL_MODE_ALIASES = { pnl: "pnl", oorbelow: "oorBelow", both: "both" };
 async function handleCustomTpSlReply(positionAddress, text) {
   const parts = text.trim().split(/\s+/);
   const tp = Number(parts[0]);
-  const sl = Number(parts[1]);
-  if (parts.length < 2 || parts.length > 3 || !Number.isFinite(tp) || !Number.isFinite(sl)) {
-    return { ok: false, text: "Couldn't parse that. Send `TP SL [mode]` like `0.8 -6` or `0.8 -6 both`, or /cancel." };
+  const slRaw = Number(parts[1]);
+  if (parts.length < 2 || parts.length > 3 || !Number.isFinite(tp) || !Number.isFinite(slRaw)) {
+    return { ok: false, text: "Couldn't parse that. Send `TP SL [mode]` like `0.8 6` or `0.8 6 both`, or /cancel." };
   }
   if (tp <= 0) return { ok: false, text: "TP must be a positive number (e.g. 0.8 for +0.8%)." };
-  if (sl >= 0) return { ok: false, text: "SL must be a negative number (e.g. -6 for -6%)." };
+  if (slRaw === 0) return { ok: false, text: "SL must be non-zero (e.g. 6 for -6%)." };
+  const sl = -Math.abs(slRaw);
 
   let slMode = "pnl";
   if (parts.length === 3) {
