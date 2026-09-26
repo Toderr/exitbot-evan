@@ -298,6 +298,15 @@ export async function adoptCandidate(positionAddress, overrides = {}) {
     // alert has already fired for the current below-range episode, so it
     // doesn't re-send every 15s tick — resets once price is back in range.
     oorBelowAlerted: false,
+    // How long an OOR-below break must persist (slMode "oorBelow"/"both"
+    // only — that's the only case OOR-below is a close trigger at all, see
+    // oorBelowHandledBySl in runExitCheck) before it actually closes, instead
+    // of closing the instant it's broken. User-chosen at adoption time via
+    // the /scan picker's OOR-duration step; 0 = close immediately (old
+    // default). OOR-above never waits on this — it's always an instant
+    // close, favorable break, no reason to hold off.
+    oorCloseDurationSec: Number.isFinite(overrides.oorCloseDurationSec) ? overrides.oorCloseDurationSec : (config.oorCloseDurationSec ?? 0),
+    oorSince: null, // timestamp the current OOR-below-as-trigger episode started, or null
     closeFailCount: 0,
   };
 
@@ -342,6 +351,30 @@ export function getAwaitingCustom() {
 
 export function clearAwaitingCustom() {
   try { fs.unlinkSync(config.awaitingCustomFile); } catch { /* already gone */ }
+}
+
+// ─── Awaiting-OOR-duration state ──────────────────────────────────────────
+// Single-slot, same reasoning as awaiting-custom above. Holds the exit-preset
+// overrides already collected (default/custom TP-SL or indicator settings)
+// while the /scan flow asks its final question — how long an OOR-below
+// break should be tolerated before auto-closing — so they can be merged
+// into one adoptCandidate() call once that's answered.
+export function setAwaitingOor(positionAddress, overrides = {}) {
+  fs.mkdirSync(path.dirname(config.awaitingOorFile), { recursive: true });
+  fs.writeFileSync(config.awaitingOorFile, JSON.stringify({ positionAddress, overrides }));
+}
+
+export function getAwaitingOor() {
+  if (!fs.existsSync(config.awaitingOorFile)) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(config.awaitingOorFile, "utf8"));
+    if (!data?.positionAddress) return null;
+    return data;
+  } catch { return null; }
+}
+
+export function clearAwaitingOor() {
+  try { fs.unlinkSync(config.awaitingOorFile); } catch { /* already gone */ }
 }
 
 export function listManaged() {
@@ -397,6 +430,7 @@ export async function rebalanceEntry(positionAddress, params) {
   entry.runnerMode = false;
   entry.touchedMinus5 = false;
   entry.oorBelowAlerted = false;
+  entry.oorSince = null;
   entry.closeFailCount = 0;
   entry.takeProfitPct = entry.baseTakeProfitPct ?? config.takeProfitPct;
 
@@ -1008,12 +1042,30 @@ export async function runExitCheck() {
       }
     }
 
-    // OOR *above* always closes (favorable break, no reason to hold off).
-    // OOR *below* only lands here — as an immediate close, same tick — when
-    // slMode explicitly treats it as a trigger (oorBelowHandledBySl above);
-    // otherwise it was already handled by the alert-only path.
-    if (!closeReason && snap.oor && oorEnabled && (snap.oorAbove || oorBelowHandledBySl)) {
-      closeReason = "OOR (out of range)";
+    // OOR *above* always closes instantly (favorable break, no reason to
+    // hold off) — never subject to the grace duration below.
+    if (!closeReason && snap.oorAbove && oorEnabled) {
+      closeReason = "OOR (out of range) — favorable break";
+    }
+
+    // OOR *below* only lands here — as a close trigger — when slMode
+    // explicitly treats it as one (oorBelowHandledBySl above); otherwise
+    // it was already handled by the alert-only path. Can optionally wait
+    // entry.oorCloseDurationSec before actually closing (user-chosen at
+    // adoption time), instead of closing the instant the range breaks.
+    if (!closeReason && oorBelowHandledBySl && oorEnabled) {
+      const graceSec = entry.oorCloseDurationSec ?? config.oorCloseDurationSec ?? 0;
+      if (graceSec <= 0) {
+        closeReason = "OOR (out of range) below range";
+      } else {
+        if (!entry.oorSince) entry.oorSince = nowSec;
+        const elapsed = nowSec - entry.oorSince;
+        if (elapsed >= graceSec) {
+          closeReason = `OOR below range for ${elapsed}s ≥ ${graceSec}s grace`;
+        }
+      }
+    } else if (entry.oorSince) {
+      entry.oorSince = null;
     }
 
     if (closeReason) {
@@ -1031,6 +1083,7 @@ export async function statusText() {
   const positions = Object.values(loadPositions());
   if (positions.length === 0) return "No managed positions. Send /scan to adopt on-chain positions.";
   const wallet = process.env.WALLET_ADDRESS;
+  const nowSec = Math.floor(Date.now() / 1000);
   const blocks = [`<p><b>Managed positions (${positions.length})</b></p>`];
   for (const entry of positions) {
     const deposit = entry.depositSol != null
@@ -1069,6 +1122,11 @@ export async function statusText() {
       row("PnL", pnlDetail),
       row("TP / SL", tpSlDetail),
     ];
+    if (entry.slMode === "oorBelow" || entry.slMode === "both") {
+      const graceSec = entry.oorCloseDurationSec ?? 0;
+      const graceLabel = graceSec > 0 ? `${graceSec}s` : "instant";
+      rows.push(row("OOR grace", esc(graceLabel) + (entry.oorSince ? ` (breaking — ${nowSec - entry.oorSince}s elapsed)` : "")));
+    }
 
     blocks.push(card({
       emoji: "📟",

@@ -24,6 +24,9 @@ import {
   setAwaitingRebalance,
   getAwaitingRebalance,
   clearAwaitingRebalance,
+  setAwaitingOor,
+  getAwaitingOor,
+  clearAwaitingOor,
 } from "./manager.js";
 import { card } from "./richCard.js";
 
@@ -421,8 +424,63 @@ async function handleAdoptAll() {
   return { ok: true, text: `✅ Now managing ${adopted.length} with defaults: ${adopted.map((a) => a.symbol).join(", ")}` };
 }
 
+// ─── OOR-duration step ─────────────────────────────────────────────────────
+// Only meaningful when slMode is "oorBelow"/"both" — that's the only case an
+// OOR-below break is a close trigger at all (plain "pnl" mode and Indicator
+// Exit always just alert on it, never close), so this step is only asked
+// then, right after the custom TP/SL text reply.
+function buildOorKeyboard(positionAddress) {
+  return {
+    inline_keyboard: [
+      [{ text: "⚡ Instan (langsung close)", callback_data: `oor:${positionAddress}:0` }],
+      [{ text: "🕔 5 menit", callback_data: `oor:${positionAddress}:300` }],
+      [{ text: "🕒 15 menit", callback_data: `oor:${positionAddress}:900` }],
+      [{ text: "🕐 1 jam", callback_data: `oor:${positionAddress}:3600` }],
+      [{ text: "✏️ Custom", callback_data: `oorcustom:${positionAddress}` }],
+    ],
+  };
+}
+
+async function handleOorCustomPrompt(positionAddress, chatId, messageId) {
+  const awaiting = getAwaitingOor();
+  if (!awaiting || awaiting.positionAddress !== positionAddress) {
+    return { text: "Prompt ini sudah kedaluwarsa — kirim /scan lagi." };
+  }
+  setAwaitingCustom(positionAddress, "oorMinutes");
+  await bot.editMessageText(
+    chatId, messageId,
+    `Kirim durasi OOR dalam menit (angka positif), contoh <code>10</code> untuk 10 menit. Kirim /cancel untuk membatalkan.`,
+  );
+  return { text: "Waiting for OOR duration…" };
+}
+
+async function handleOorMinutesReply(positionAddress, text) {
+  const minutes = Number(text.trim());
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return { ok: false, text: "Nggak kebaca. Kirim angka menit positif, contoh 10, atau /cancel." };
+  }
+  return finalizeOorAdoption(positionAddress, Math.round(minutes * 60));
+}
+
+async function finalizeOorAdoption(positionAddress, oorCloseDurationSec) {
+  const awaiting = getAwaitingOor();
+  if (!awaiting || awaiting.positionAddress !== positionAddress) {
+    return { ok: false, text: "Prompt ini sudah kedaluwarsa — kirim /scan lagi." };
+  }
+  clearAwaitingOor();
+  clearAwaitingCustom();
+  const entry = await adoptCandidate(positionAddress, { ...awaiting.overrides, oorCloseDurationSec });
+  if (!entry) return { ok: true, text: "That candidate is no longer pending — try /scan again." };
+  const graceLabel = oorCloseDurationSec > 0 ? `${oorCloseDurationSec}s` : "instan";
+  return {
+    ok: true,
+    text: `✅ Now managing ${entry.symbol} (${positionAddress.slice(0, 6)}…) — custom TP +${entry.takeProfitPct}% / SL ${entry.stopLossPct}% (SL mode: ${entry.slMode}). OOR grace: ${graceLabel}.`,
+  };
+}
+
 // Parses "<TP> <SL>" from a plain-text reply while a custom-TP/SL prompt is
-// outstanding. Returns { ok, text } — on success, the position is adopted.
+// outstanding. Returns { ok, text } — on success, either the position is
+// adopted directly, or (slMode oorBelow/both) the OOR-duration step starts.
 const SL_MODE_ALIASES = { pnl: "pnl", oorbelow: "oorBelow", both: "both" };
 
 async function handleCustomTpSlReply(positionAddress, text) {
@@ -440,6 +498,17 @@ async function handleCustomTpSlReply(positionAddress, text) {
   if (parts.length === 3) {
     slMode = SL_MODE_ALIASES[parts[2].toLowerCase()];
     if (!slMode) return { ok: false, text: "SL mode must be `pnl`, `oorbelow`, or `both`, or /cancel." };
+  }
+
+  if (slMode === "oorBelow" || slMode === "both") {
+    clearAwaitingCustom();
+    setAwaitingOor(positionAddress, { takeProfitPct: tp, stopLossPct: sl, slMode });
+    return {
+      ok: true,
+      text: `TP +${tp}% / SL ${sl}% (mode: ${slMode}) — SL mode ini bisa close langsung begitu harga keluar dari range bawah. ` +
+        `Berapa lama harga boleh keluar range sebelum auto-close?`,
+      replyMarkup: buildOorKeyboard(positionAddress),
+    };
   }
 
   const entry = await adoptCandidate(positionAddress, { takeProfitPct: tp, stopLossPct: sl, slMode });
@@ -500,6 +569,17 @@ export function startListener() {
               } else if (data.startsWith("customtp:")) {
                 result = await handleCustomTpPrompt(data.slice("customtp:".length), chat, msgId);
                 await bot.answerCallbackQuery(cq.id, { text: result.text });
+              } else if (data.startsWith("oorcustom:")) {
+                result = await handleOorCustomPrompt(data.slice("oorcustom:".length), chat, msgId);
+                await bot.answerCallbackQuery(cq.id, { text: result.text });
+              } else if (data.startsWith("oor:")) {
+                const rest = data.slice("oor:".length);
+                const sep = rest.lastIndexOf(":");
+                const posAddr = rest.slice(0, sep);
+                const seconds = Number(rest.slice(sep + 1));
+                result = await finalizeOorAdoption(posAddr, seconds);
+                await bot.answerCallbackQuery(cq.id, { text: result.text.slice(0, 190) });
+                if (result.ok) await bot.editMessageText(chat, msgId, esc(result.text));
               } else if (data.startsWith("rebalpick:")) {
                 result = await handleRebalancePick(data.slice("rebalpick:".length), chat, msgId);
                 await bot.answerCallbackQuery(cq.id, { text: result.text });
@@ -575,8 +655,10 @@ export function startListener() {
             try {
               const result = awaiting.kind === "indicatorSl"
                 ? await handleIndicatorSlReply(awaiting.positionAddress, text)
+                : awaiting.kind === "oorMinutes"
+                ? await handleOorMinutesReply(awaiting.positionAddress, text)
                 : await handleCustomTpSlReply(awaiting.positionAddress, text);
-              await bot.sendMessage(result.text);
+              await bot.sendHTML(result.text, { replyMarkup: result.replyMarkup });
             } catch (e) {
               log("listener_error", `custom reply handling failed: ${e.message}`);
               await bot.sendMessage(`❌ Error: ${e.message}`);
@@ -589,6 +671,7 @@ export function startListener() {
           if (cmd === "/scan") {
             clearAwaitingCustom();
             clearAwaitingRebalance();
+            clearAwaitingOor();
             try {
               await handleScan();
             } catch (e) {
@@ -623,10 +706,14 @@ export function startListener() {
           } else if (cmd === "/cancel") {
             if (awaiting) {
               clearAwaitingCustom();
+              clearAwaitingOor();
               await bot.sendMessage("Cancelled. Send /scan to try again.");
             } else if (awaitingRebal) {
               clearAwaitingRebalance();
               await bot.sendMessage("Rebalance cancelled. Send /rebalance to try again.");
+            } else if (getAwaitingOor()) {
+              clearAwaitingOor();
+              await bot.sendMessage("Cancelled. Send /scan to try again.");
             } else {
               await bot.sendMessage("Nothing to cancel.");
             }

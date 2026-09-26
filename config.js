@@ -17,6 +17,14 @@ export const config = {
   takeProfitPct: 0.5,   // auto-close at +0.5% PnL
   oorCloseEnabled: true, // auto-close when out of range (either direction)
 
+  // How long an OOR-below break must persist before it actually closes —
+  // only relevant when slMode is "oorBelow"/"both" (that's the only case
+  // OOR-below is a close trigger at all; otherwise it's alert-only, see
+  // manager.js). 0 = close the instant it breaks (old default). Overridable
+  // per-position at adoption time via the /scan picker's OOR-duration step.
+  // OOR-above is unaffected — always an instant close.
+  oorCloseDurationSec: 0,
+
   // How the SL trigger is evaluated. Independent of oorCloseEnabled above,
   // which still closes on OOR in *either* direction regardless of this.
   //   "pnl"      — SL fires only when PnL% <= stopLossPct (default, legacy behavior)
@@ -124,4 +132,5 @@ export const config = {
   pendingScanFile: "./state/pending-scan.json",
   awaitingCustomFile: "./state/awaiting-custom.json",
   awaitingRebalanceFile: "./state/awaiting-rebalance.json",
+  awaitingOorFile: "./state/awaiting-oor.json",
 };

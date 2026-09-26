@@ -83,6 +83,14 @@ its older README figures):
   hits first
 - SL requires 2 consecutive 15s ticks at/below threshold (datapi glitch filter,
   applies to whichever condition slMode is evaluating)
+- OOR-below grace (`config.oorCloseDurationSec`, default `0`): only relevant
+  when SL mode is `"oorBelow"`/`"both"` (the only case OOR-below is a close
+  trigger at all — see above). `0` closes the instant the range breaks (old
+  default); a longer duration waits that many seconds of sustained OOR-below
+  before actually closing, instead of closing on the first break. Set
+  per-position in the /scan custom TP/SL flow, right after picking
+  `oorbelow`/`both` as the SL mode (preset buttons for 5m/15m/1h, or a custom
+  number of minutes). OOR-above is never subject to this — always instant.
 - High-TVL guard: if pool TVL > 20% of the token's MCap (from DexScreener at
   scan time), tighten TP to +0.1% until TVL/MCap drops back down (SL is left
   untouched). **Only applies to positions still on the default TP/SL** — if
