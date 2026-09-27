@@ -984,8 +984,11 @@ export async function runExitCheck() {
     // either direction regardless of slMode. entry.stopLossPct is null when
     // an indicator-mode position declined SL — pnlSlHit stays false then.
     const slMode = entry.slMode ?? config.slMode ?? "pnl";
+    const oorGraceSec = entry.oorCloseDurationSec ?? config.oorCloseDurationSec ?? 0;
     const pnlSlHit = entry.stopLossPct != null && snap.pnlPct != null && snap.pnlPct <= entry.stopLossPct;
-    const oorBelowSlHit = snap.oorBelow === true;
+    // With a grace duration set, OOR-below is closed by the grace timer below
+    // instead — firing it here too would close after 2 ticks and skip the grace.
+    const oorBelowSlHit = snap.oorBelow === true && oorGraceSec <= 0;
     const slHit = slEnabled && (
       slMode === "oorBelow" ? oorBelowSlHit :
       slMode === "both" ? (pnlSlHit || oorBelowSlHit) :
@@ -1053,16 +1056,11 @@ export async function runExitCheck() {
     // it was already handled by the alert-only path. Can optionally wait
     // entry.oorCloseDurationSec before actually closing (user-chosen at
     // adoption time), instead of closing the instant the range breaks.
-    if (!closeReason && oorBelowHandledBySl && oorEnabled) {
-      const graceSec = entry.oorCloseDurationSec ?? config.oorCloseDurationSec ?? 0;
-      if (graceSec <= 0) {
-        closeReason = "OOR (out of range) below range";
-      } else {
-        if (!entry.oorSince) entry.oorSince = nowSec;
-        const elapsed = nowSec - entry.oorSince;
-        if (elapsed >= graceSec) {
-          closeReason = `OOR below range for ${elapsed}s ≥ ${graceSec}s grace`;
-        }
+    if (!closeReason && snap.oorBelow && oorBelowHandledBySl && oorEnabled && oorGraceSec > 0) {
+      if (!entry.oorSince) entry.oorSince = nowSec;
+      const elapsed = nowSec - entry.oorSince;
+      if (elapsed >= oorGraceSec) {
+        closeReason = `OOR below range for ${elapsed}s ≥ ${oorGraceSec}s grace`;
       }
     } else if (entry.oorSince) {
       entry.oorSince = null;
