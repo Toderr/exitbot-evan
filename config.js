@@ -88,7 +88,7 @@ export const config = {
     keepOorClose: true,     // OOR still closes an indicator-exit position
   },
 
-  // Manual /rebalance — recenters a managed position's liquidity to the
+  // Manual /rebalance — recenters a position's (managed or not) liquidity to the
   // pool's current price. Uses the DLMM SDK's native rebalance instruction
   // (withdraw 100% + redeposit in one on-chain instruction, same position
   // address) — the same primitive other DLMM bots expose as a single

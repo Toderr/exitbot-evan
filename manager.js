@@ -389,7 +389,7 @@ export function forget(positionAddress) {
   return true;
 }
 
-// ─── /rebalance — recenter a managed position's liquidity to current price ──
+// ─── /rebalance — recenter a position's liquidity to current price ─────────
 // User-triggered only (never run by the 15s cron). Withdraws 100% of the
 // position's liquidity + fees and redeposits — quote (SOL) side only, in a
 // range strictly below the current active bin — see
@@ -397,14 +397,28 @@ export function forget(positionAddress) {
 // SL/TP config carries over unchanged; only the range/deposit/grace-period
 // fields are refreshed to reflect the new liquidity.
 //
+// Works on managed positions *and* on not-yet-managed ones: /rebalance runs
+// a fresh scanOnChain first, so every unmanaged SOL-quoted position sits in
+// pending-scan.json and can be targeted too. Rebalancing an unmanaged
+// position doesn't adopt it — it only refreshes its pending candidate (new
+// bins/shape/deposit), so it can still be picked from /scan afterwards.
+//
 // `params.shape` ("Spot"|"Curve"|"BidAsk"), `params.rangeBins` (positive
 // int bin width), and `params.depositSol` (SOL amount, or null/undefined to
 // redeposit everything withdrawn) are all asked interactively in the
 // /rebalance Telegram flow — see setAwaitingRebalance below.
+export function getRebalanceTarget(positionAddress) {
+  const managed = loadPositions()[positionAddress];
+  if (managed) return { ...managed, managed: true };
+  const candidate = loadPending()[positionAddress];
+  if (candidate) return { ...candidate, managed: false };
+  return null;
+}
+
 export async function rebalanceEntry(positionAddress, params) {
-  const positions = loadPositions();
-  const entry = positions[positionAddress];
-  if (!entry) return { ok: false, error: "Position is not currently managed." };
+  const target = getRebalanceTarget(positionAddress);
+  if (!target) return { ok: false, error: "Position not found — send /rebalance again to rescan." };
+  const isManaged = target.managed;
 
   const strategy = params.shape;
   const rangeBins = params.rangeBins;
@@ -414,39 +428,49 @@ export async function rebalanceEntry(positionAddress, params) {
   const result = await rebalancePositionOneSidedQuote(
     process.env.HELIUS_RPC_URL,
     process.env.SOLANA_PRIVATE_KEY,
-    entry.poolAddress,
+    target.poolAddress,
     { publicKey: positionAddress },
     { strategy, rangeBins, depositLamports, maxActiveBinSlippage },
   );
+
+  const { depositSol, depositUsd } = await fetchPositionDeposit(target.poolAddress, process.env.WALLET_ADDRESS, positionAddress).catch(() => ({ depositSol: null, depositUsd: null }));
+
+  // Re-read state after the (slow) on-chain calls so a concurrent cron tick
+  // or /scan write isn't clobbered with a stale copy.
+  const store = isManaged ? loadPositions() : loadPending();
+  const entry = store[positionAddress] ?? (({ managed, ...rest }) => rest)(target);
 
   entry.lowerBinId = result.lowerBinId;
   entry.upperBinId = result.upperBinId;
   entry.binCount = result.upperBinId - result.lowerBinId + 1;
   entry.shape = `${strategy} (one-side quote, rebalanced)`;
-  // Fresh grace period — the position's PnL/range are effectively reset by
-  // the withdraw+redeposit, so don't evaluate SL/TP against it immediately.
-  entry.adoptedAt = Math.floor(Date.now() / 1000);
-  entry.highTvlMode = false;
-  entry.runnerMode = false;
-  entry.touchedMinus5 = false;
-  entry.oorBelowAlerted = false;
-  entry.oorSince = null;
-  entry.closeFailCount = 0;
-  entry.takeProfitPct = entry.baseTakeProfitPct ?? config.takeProfitPct;
-
-  const { depositSol, depositUsd } = await fetchPositionDeposit(entry.poolAddress, process.env.WALLET_ADDRESS, positionAddress).catch(() => ({ depositSol: null, depositUsd: null }));
   if (depositSol != null || depositUsd != null) {
     entry.depositSol = depositSol;
     entry.depositUsd = depositUsd;
   }
 
-  positions[positionAddress] = entry;
-  savePositions(positions);
-  slBelowCount.delete(positionAddress);
-  missingCount.delete(positionAddress);
+  if (isManaged) {
+    // Fresh grace period — the position's PnL/range are effectively reset by
+    // the withdraw+redeposit, so don't evaluate SL/TP against it immediately.
+    entry.adoptedAt = Math.floor(Date.now() / 1000);
+    entry.highTvlMode = false;
+    entry.runnerMode = false;
+    entry.touchedMinus5 = false;
+    entry.oorBelowAlerted = false;
+    entry.oorSince = null;
+    entry.closeFailCount = 0;
+    entry.takeProfitPct = entry.baseTakeProfitPct ?? config.takeProfitPct;
+    store[positionAddress] = entry;
+    savePositions(store);
+    slBelowCount.delete(positionAddress);
+    missingCount.delete(positionAddress);
+  } else {
+    store[positionAddress] = entry;
+    savePending(store);
+  }
 
-  log("manager", `Rebalanced ${positionAddress.slice(0, 8)} (${entry.symbol}) → bins ${entry.lowerBinId}-${entry.upperBinId}, deposited ${(Number(result.depositedLamports) / 1e9).toFixed(4)} SOL`);
-  return { ok: true, entry, sigs: result.sigs, depositedSol: Number(result.depositedLamports) / 1e9 };
+  log("manager", `Rebalanced ${isManaged ? "" : "unmanaged "}${positionAddress.slice(0, 8)} (${entry.symbol}) → bins ${entry.lowerBinId}-${entry.upperBinId}, deposited ${(Number(result.depositedLamports) / 1e9).toFixed(4)} SOL`);
+  return { ok: true, entry, managed: isManaged, sigs: result.sigs, depositedSol: Number(result.depositedLamports) / 1e9 };
 }
 
 // ─── Awaiting-rebalance-reply state ───────────────────────────────────────

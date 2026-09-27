@@ -156,6 +156,7 @@ Notes:
 |---|---|
 | `/scan` | Enumerate wallet on-chain, show a button per new SOL-quoted position (one per position, not per pool) to pick which to manage, then pick its exit preset (default TP/SL · custom TP/SL · Indicator Exit) |
 | `/status` | List currently managed positions + their TP/SL |
+| `/rebalance` | Scan wallet, pick any SOL-quoted position (managed **or not yet managed**), choose shape/range/deposit, and recenter its liquidity quote-only (SOL) strictly below the active bin. Rebalancing an unmanaged position doesn't adopt it — the result offers a "Manage" button that opens the usual exit-preset picker |
 | `/stop` | Show a picker: stop managing one specific position, or "Stop ALL" to stop managing every currently managed position (each left untouched on-chain) — the bot itself and its 15s cron keep running |
 | `/forget <positionAddress>` | Stop managing a position directly by address (does not close it on-chain) |
 | `/help` | Show command list |

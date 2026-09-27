@@ -21,6 +21,7 @@ import {
   getAwaitingCustom,
   clearAwaitingCustom,
   rebalanceEntry,
+  getRebalanceTarget,
   setAwaitingRebalance,
   getAwaitingRebalance,
   clearAwaitingRebalance,
@@ -50,7 +51,7 @@ const HELP_TEXT =
   "(15m RSI(2)&gt;90 AND (MACD first green histogram OR close &gt; upper Bollinger) — " +
   "SL is opt-in with your own percent, OOR still applies)\n" +
   "/status — list currently managed positions\n" +
-  "/rebalance — pick a managed position, choose a shape/range/deposit amount, and recenter its liquidity to the current price — " +
+  "/rebalance — pick a position (managed or not yet managed), choose a shape/range/deposit amount, and recenter its liquidity to the current price — " +
   "quote (SOL) side only, strictly below the active bin\n" +
   "/stop — pick a managed position to stop managing (or stop ALL managed positions)\n" +
   "/forget &lt;positionAddress&gt; — stop managing a position without closing it\n" +
@@ -97,29 +98,44 @@ function handleStopAll() {
   return { ok: true, text: `⛔ Stopped managing all ${managed.length} position(s) (left untouched on-chain).` };
 }
 
-// /rebalance picker: one button per managed position, then a confirm step —
-// this moves real on-chain funds (withdraw + redeposit), so a single button
-// tap from /stop's list isn't enough; require a second explicit tap.
-function buildRebalanceKeyboard(managed) {
+// /rebalance picker: one button per position — managed ones first, then
+// every unmanaged SOL-quoted position found by a fresh on-chain scan — then
+// a confirm step: this moves real on-chain funds (withdraw + redeposit), so
+// a single button tap from /stop's list isn't enough; require a second
+// explicit tap.
+function buildRebalanceKeyboard(managed, unmanaged) {
   return {
-    inline_keyboard: managed.map((p) => ([
-      { text: `⚖️ ${p.symbol} (${p.positionAddress.slice(0, 6)}…)`, callback_data: `rebalpick:${p.positionAddress}` },
-    ])),
+    inline_keyboard: [
+      ...managed.map((p) => ([
+        { text: `⚖️ ${p.symbol} (${p.positionAddress.slice(0, 6)}…)`, callback_data: `rebalpick:${p.positionAddress}` },
+      ])),
+      ...unmanaged.map((p) => ([
+        { text: `🆕 ${p.symbol} (${p.positionAddress.slice(0, 6)}…) — unmanaged`, callback_data: `rebalpick:${p.positionAddress}` },
+      ])),
+    ],
   };
 }
 
 async function handleRebalance() {
   const managed = listManaged();
-  if (managed.length === 0) {
-    await bot.sendMessage("Nothing is currently managed.");
+  await bot.sendMessage("🔎 Scanning wallet for positions to rebalance…");
+  let unmanaged = [];
+  try {
+    ({ candidates: unmanaged } = await scanOnChain(process.env.HELIUS_RPC_URL, process.env.WALLET_ADDRESS));
+  } catch (e) {
+    log("listener_error", `/rebalance scan failed: ${e.message}`);
+    if (managed.length === 0) throw e;
+    await bot.sendMessage(`⚠️ On-chain scan failed (${e.message}) — only managed positions are listed.`);
+  }
+  if (managed.length === 0 && unmanaged.length === 0) {
+    await bot.sendMessage("No open SOL-quoted DLMM positions found.");
     return;
   }
-  const lines = [
-    "Which position should I recenter to the current price?",
-    "",
-    ...managed.map((p) => `• <b>${esc(p.symbol)}</b> (<code>${esc(p.positionAddress.slice(0, 8))}…</code>) — bins ${p.lowerBinId}–${p.upperBinId}`),
-  ];
-  await bot.sendHTML(lines.join("\n"), { replyMarkup: buildRebalanceKeyboard(managed) });
+  const describe = (p) => `• <b>${esc(p.symbol)}</b> (<code>${esc(p.positionAddress.slice(0, 8))}…</code>) — bins ${p.lowerBinId}–${p.upperBinId}`;
+  const lines = ["Which position should I recenter to the current price?"];
+  if (managed.length > 0) lines.push("", "<b>Managed:</b>", ...managed.map(describe));
+  if (unmanaged.length > 0) lines.push("", "<b>Not managed</b> (rebalancing won't adopt it):", ...unmanaged.map(describe));
+  await bot.sendHTML(lines.join("\n"), { replyMarkup: buildRebalanceKeyboard(managed, unmanaged) });
 }
 
 // Step 2: shape choice for the recentered (quote-only) range.
@@ -134,8 +150,8 @@ function buildRebalanceShapeKeyboard(positionAddress) {
 }
 
 async function handleRebalancePick(positionAddress, chatId, messageId) {
-  const entry = listManaged().find((p) => p.positionAddress === positionAddress);
-  if (!entry) return { text: "That position is no longer managed." };
+  const entry = getRebalanceTarget(positionAddress);
+  if (!entry) return { text: "That position is no longer available — send /rebalance again." };
   clearAwaitingRebalance();
   await bot.editMessageText(
     chatId, messageId,
@@ -147,8 +163,8 @@ async function handleRebalancePick(positionAddress, chatId, messageId) {
 }
 
 async function handleRebalanceShapePick(positionAddress, shape, chatId, messageId) {
-  const entry = listManaged().find((p) => p.positionAddress === positionAddress);
-  if (!entry) return { text: "That position is no longer managed." };
+  const entry = getRebalanceTarget(positionAddress);
+  if (!entry) return { text: "That position is no longer available — send /rebalance again." };
   setAwaitingRebalance(positionAddress, "range", { shape });
   await bot.editMessageText(
     chatId, messageId,
@@ -183,7 +199,7 @@ async function handleRebalanceDepositReply(awaiting, text) {
     }
   }
   setAwaitingRebalance(awaiting.positionAddress, "confirm", { shape: awaiting.shape, rangeBins: awaiting.rangeBins, depositSol });
-  const entry = listManaged().find((p) => p.positionAddress === awaiting.positionAddress);
+  const entry = getRebalanceTarget(awaiting.positionAddress);
   const depositLabel = depositSol != null ? `${depositSol} SOL` : "everything withdrawn (max)";
   return {
     ok: true,
@@ -213,13 +229,19 @@ async function handleRebalanceConfirm(positionAddress, chatId, messageId) {
   if (!result.ok) {
     return { ok: false, text: `❌ Rebalance failed: ${esc(result.error)}` };
   }
-  const { entry, sigs, depositedSol } = result;
+  const { entry, managed, sigs, depositedSol } = result;
   return {
     ok: true,
     text: `⚖️ <b>Rebalanced</b> — <b>${esc(entry.symbol)}</b> (<code>${esc(positionAddress.slice(0, 8))}…</code>)\n` +
       `New bins: ${entry.lowerBinId}–${entry.upperBinId} (quote-only)\n` +
       `Deposited: <b>${depositedSol.toFixed(4)} SOL</b>\n` +
-      sigs.map((s) => `<code>${esc(s.slice(0, 20))}…</code>`).join("\n"),
+      sigs.map((s) => `<code>${esc(s.slice(0, 20))}…</code>`).join("\n") +
+      (managed ? "" : "\n\nThis position is <b>not managed</b> — tap below to pick an exit preset for it, or leave it unmanaged."),
+    // Unmanaged: offer adoption straight away — reuses the /scan picker's
+    // pick: flow, since rebalanceEntry left it in pending-scan.json.
+    replyMarkup: managed ? undefined : {
+      inline_keyboard: [[{ text: `🛡️ Manage ${entry.symbol}`, callback_data: `pick:${positionAddress}` }]],
+    },
   };
 }
 
@@ -596,7 +618,7 @@ export function startListener() {
                 await bot.answerCallbackQuery(cq.id, { text: "Rebalancing…" });
                 try {
                   result = await handleRebalanceConfirm(data.slice("rebalconfirm:".length), chat, msgId);
-                  await bot.editMessageText(chat, msgId, result.text);
+                  await bot.editMessageText(chat, msgId, result.text, { replyMarkup: result.replyMarkup });
                 } catch (e) {
                   log("listener_error", `rebalance failed: ${e.message}`);
                   await bot.editMessageText(chat, msgId, `❌ Rebalance failed: ${esc(e.message)}`);
